@@ -846,7 +846,7 @@ def plot_irradiance_with_marginal_means(
 
     joint_plot_grid.ax_joint.set_xlabel("Mean angle from polytunnel axis")
     joint_plot_grid.ax_joint.set_ylabel("Hour of the day")
-    joint_plot_grid.ax_joint.set_title(initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y") )
+    joint_plot_grid.ax_joint.set_title(initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y")
     joint_plot_grid.ax_joint.legend().remove()
 
     # Remove ticks from axes
