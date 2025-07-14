@@ -594,7 +594,7 @@ def process_single_mpp_calculation(
 ) -> tuple[int, float, str]:
     try:
         max_irradiance = np.max(
-            irradiance_frame.set_index("hour").iloc[time_of_day][1:]
+            irradiance_frame.set_index("hour").iloc[time_of_day]#[1:]
         )
         if max_irradiance == 0:
             return None, None, None
@@ -631,7 +631,7 @@ def process_single_mpp_calculation(
                 ],
                 1000
                 * irradiance_frame.set_index("hour")
-                .iloc[time_of_day][1:]
+                .iloc[time_of_day]#[1:]
                 .reset_index(drop=True),
                 current_series=current_series,
             )
@@ -702,8 +702,12 @@ def process_single_mpp_calculation_without_pbar(
         date_str = date.strftime("%d_%b_%Y")
 
         max_irradiance = np.max(
-            irradiance_frame.set_index("hour").iloc[time_of_day][1:]
+            irradiance_frame.set_index("hour").iloc[time_of_day]#[1:]
         )
+        # print(f"DEBUG: t_o_d: {time_of_day}, hr: {hour}, \
+        #     irradiance frame tod: {irradiance_frame.iloc[time_of_day]}, \
+        #     irradiance frame hour: {irradiance_frame.iloc[hour]}")
+
         if max_irradiance == 0:
             return hour, 0, date_str
 
@@ -735,7 +739,7 @@ def process_single_mpp_calculation_without_pbar(
                 ],
                 1000
                 * irradiance_frame.set_index("hour")
-                .iloc[time_of_day][1:]
+                .iloc[time_of_day]#[1:]
                 .reset_index(drop=True),
                 current_series=current_series,
             )
@@ -947,6 +951,7 @@ def main(unparsed_arguments) -> None:
 
     # Parse the command-line arguments.
     parsed_args = _parse_args(unparsed_arguments)
+    print(f"DEBUG: parsed_args.start_day_index = {parsed_args.start_day_index}, parsed_args.iteration_length = {parsed_args.iteration_length}")
 
     # Parse all of the input files
     print(
@@ -1134,7 +1139,7 @@ def main(unparsed_arguments) -> None:
             break
 
     if skipped:
-        # print("Skipping calculation of irradiance and using irradiance from file")
+        print("DEBUG: Skipping calculation of irradiance and using irradiance from file")
 
         cellwise_irradiance_frames = []
 
@@ -1177,6 +1182,7 @@ def main(unparsed_arguments) -> None:
         irradiance_frame = [
             entry[1] for entry in cellwise_irradiance_frames if entry[0] == scenario
         ][0]
+        print(f"DEBUG: irradiance frame {irradiance_frame.iloc[0:25,:2]}")
     except IndexError:
         raise Exception("Internal error occurred.") from None
 
@@ -1279,7 +1285,7 @@ def main(unparsed_arguments) -> None:
             1000
             * irradiance_frame.set_index("hour")
             .iloc[(plotting_time_of_day := 4812)]
-            .values[pv_cell.cell_id + 1]
+            .values[pv_cell.cell_id]# + 1]
             for pv_cell in scenario.pv_module.pv_cells
         ],
         color="orange",
@@ -1309,7 +1315,7 @@ def main(unparsed_arguments) -> None:
                 1000
                 * irradiance_frame.set_index("hour")
                 .iloc[plotting_time_of_day]
-                .iloc[pv_cell.cell_id + 1],
+                .iloc[pv_cell.cell_id],# + 1],
                 0,
             )
             - 273.15
@@ -1382,6 +1388,7 @@ def main(unparsed_arguments) -> None:
     axes[3, 0].get_shared_x_axes().join(axes[3, 0], axes[4, 0])
     axes[3, 1].get_shared_x_axes().join(axes[3, 1], axes[4, 1])
     axes[0, 1].get_shared_x_axes().join(axes[0, 1], axes[1, 1])
+    
 
     curve_info = pvlib.pvsystem.singlediode(
         photocurrent=IL,
