@@ -1202,73 +1202,80 @@ def main(unparsed_arguments) -> None:
     output_directory = "outputs"
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
+    
+    # Check if output file already exists:
+    output_file = os.path.join(output_directory, f"mpp_daily_summary_{scenario.name}.xlsx")
+    if os.path.exists(output_file):
+        print(f"Output file {output_file} already exists. Skipping computation.")
+    
+    else:
+        # Use joblib to parallelize the for loop
+        start_time = time.time()
+        with tqdm(
+            desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
+        ) as pbar:
+            # with ThreadPool(8) as mpool:
+            #     results_map = mpool.map(
+            #         functools.partial(
+            #             process_single_mpp_calculation,
+            #             irradiance_frame=irradiance_frame,
+            #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+            #             pbar=pbar,
+            #             pv_system=pv_system,
+            #             scenario=scenario,
+            #         ),
+            #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
+            #     )
 
-    # Use joblib to parallelize the for loop
-    start_time = time.time()
-    with tqdm(
-        desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
-    ) as pbar:
-        # with ThreadPool(8) as mpool:
-        #     results_map = mpool.map(
-        #         functools.partial(
-        #             process_single_mpp_calculation,
-        #             irradiance_frame=irradiance_frame,
-        #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-        #             pbar=pbar,
-        #             pv_system=pv_system,
-        #             scenario=scenario,
-        #         ),
-        #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
-        #     )
-
-        results = Parallel(n_jobs=8)(
-            delayed(
-                functools.partial(
-                    process_single_mpp_calculation_without_pbar,
-                    irradiance_frame=irradiance_frame,
-                    locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-                    pv_system=pv_system,
-                    scenario=scenario,
+            results = Parallel(n_jobs=8)(
+                delayed(
+                    functools.partial(
+                        process_single_mpp_calculation_without_pbar,
+                        irradiance_frame=irradiance_frame,
+                        locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                        pv_system=pv_system,
+                        scenario=scenario,
+                    )
+                )(time_of_day)
+                for time_of_day in range(
+                    parsed_args.start_day_index,
+                    parsed_args.start_day_index + parsed_args.iteration_length,
                 )
-            )(time_of_day)
-            for time_of_day in range(
-                parsed_args.start_day_index,
-                parsed_args.start_day_index + parsed_args.iteration_length,
             )
-        )
 
-    end_time = time.time()
-    print(f"Parallel processing took {end_time - start_time:.2f} seconds")
+        end_time = time.time()
+        print(f"Parallel processing took {end_time - start_time:.2f} seconds")
 
-    # Process results and accumulate daily data
-    all_mpp_data = []
+        # Process results and accumulate daily data
+        all_mpp_data = []
 
-    for result in results:
-        if result is not None:
-            hour, mpp_power, date_str = result
-            if mpp_power is not None:
-                daily_data[date_str].append((hour, mpp_power))
-                all_mpp_data.append((date_str, hour, mpp_power))
+        for result in results:
+            if result is not None:
+                hour, mpp_power, date_str = result
+                if mpp_power is not None:
+                    daily_data[date_str].append((hour, mpp_power))
+                    all_mpp_data.append((date_str, hour, mpp_power))
 
-    # Save daily data to a single Excel file with separate sheets
-    with pd.ExcelWriter(
-        os.path.join(output_directory, f"mpp_daily_summary_{scenario.name}.xlsx"),
-        engine="openpyxl",
-    ) as writer:
+        # Save daily data to a single Excel file with separate sheets
+        with pd.ExcelWriter(
+            os.path.join(output_directory, f"mpp_daily_summary_{scenario.name}.xlsx"),
+            engine="openpyxl",
+        ) as writer:
 
-        # Ensure at least one sheet is present and visible
-        workbook = writer.book
-        placeholder_sheet = workbook.create_sheet(title="Sheet1")
+            # Ensure at least one sheet is present and visible
+            workbook = writer.book
+            placeholder_sheet = workbook.create_sheet(title="Sheet1")
 
-        for date_str, data in daily_data.items():
-            df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
-            total_mpp = df["MPP (W)"].sum()
-            df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
-            df.to_excel(writer, sheet_name=date_str, index=False)
+            for date_str, data in daily_data.items():
+                df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
+                total_mpp = df["MPP (W)"].sum()
+                df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
+                df.to_excel(writer, sheet_name=date_str, index=False)
 
-        # Remove the placeholder sheet if it was not used
-        if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
-            del workbook["Sheet1"]
+            # Remove the placeholder sheet if it was not used
+            if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
+                del workbook["Sheet1"]
+    
 
     # #TODO:
     # # - Improve the speed of the calculation so it can be run for all hours.
@@ -1384,55 +1391,60 @@ def main(unparsed_arguments) -> None:
     axes[2, 1].set_visible(False)
     y_label_coord: int = int(-850)
 
-    axes[0, 0].get_shared_x_axes().join(axes[0, 0], axes[1, 0])
-    axes[3, 0].get_shared_x_axes().join(axes[3, 0], axes[4, 0])
-    axes[3, 1].get_shared_x_axes().join(axes[3, 1], axes[4, 1])
-    axes[0, 1].get_shared_x_axes().join(axes[0, 1], axes[1, 1])
+    # axes[0, 0].get_shared_x_axes().join(axes[0, 0], axes[1, 0])
+    # axes[3, 0].get_shared_x_axes().join(axes[3, 0], axes[4, 0])
+    # axes[3, 1].get_shared_x_axes().join(axes[3, 1], axes[4, 1])
+    # axes[0, 1].get_shared_x_axes().join(axes[0, 1], axes[1, 1])
+    axes[1, 0].sharex(axes[0, 0])
+    axes[4, 0].sharex(axes[3, 0])
+    axes[4, 1].sharex(axes[3, 1])
+    axes[1, 1].sharex(axes[0, 1])
     
 
-    curve_info = pvlib.pvsystem.singlediode(
-        photocurrent=IL,
-        saturation_current=I0,
-        resistance_series=Rs,
-        resistance_shunt=Rsh,
-        nNsVth=nNsVth,
-        ivcurve_pnts=100,
-        method="lambertw",
-    )
-    plt.plot(curve_info["v"], curve_info["i"])
+    # curve_info = pvlib.pvsystem.singlediode(
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     ivcurve_pnts=100,
+    #     method="lambertw",
+    # )
+    #plt.plot(curve_info["v"], curve_info["i"])
+    plt.axhline(1, color="grey", linestyle="--", linewidth=0.5, alpha=0.5)
     plt.show()
 
-    pvlib.singlediode.bishop88_i_from_v(
-        -14.95,
-        photocurrent=IL,
-        saturation_current=I0,
-        resistance_series=Rs,
-        resistance_shunt=Rsh,
-        nNsVth=nNsVth,
-        breakdown_voltage=-15,
-        breakdown_factor=2e-3,
-        breakdown_exp=3,
-    )
+    # pvlib.singlediode.bishop88_i_from_v(
+    #     -14.95,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     breakdown_voltage=-15,
+    #     breakdown_factor=2e-3,
+    #     breakdown_exp=3,
+    # )
 
-    v_oc = pvlib.singlediode.bishop88_v_from_i(
-        0.0,
-        photocurrent=IL,
-        saturation_current=I0,
-        resistance_series=Rs,
-        resistance_shunt=Rsh,
-        nNsVth=nNsVth,
-        method="lambertw",
-    )
-    voltage_array = np.linspace(-15 * 0.999, v_oc, 1000)
-    ivcurve_i, ivcurve_v, _ = pvlib.singlediode.bishop88(
-        voltage_array,
-        photocurrent=IL,
-        saturation_current=I0,
-        resistance_series=Rs,
-        resistance_shunt=Rsh,
-        nNsVth=nNsVth,
-        breakdown_voltage=-15,
-    )
+    # v_oc = pvlib.singlediode.bishop88_v_from_i(
+    #     0.0,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     method="lambertw",
+    # )
+    # voltage_array = np.linspace(-15 * 0.999, v_oc, 1000)
+    # ivcurve_i, ivcurve_v, _ = pvlib.singlediode.bishop88(
+    #     voltage_array,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     breakdown_voltage=-15,
+    # )
 
     # Determine the scenario index
     try:
@@ -1473,10 +1485,12 @@ def main(unparsed_arguments) -> None:
     plt.xlabel("Cell index within panel")
     plt.ylabel("Hour of the day")
     plt.show()
+    
+    pdb.set_trace()
 
     frame_to_plot = cellwise_irradiance_frames[scenario_index][1]
     date_and_time_series = frame_to_plot.pop(date_and_time)
-    initial_time = datetime.strptime(date_and_time_series.iloc[0], "%Y-%m-%d %H:%M")
+    initial_time = datetime.strptime(str(date_and_time_series.iloc[0]), "%Y-%m-%d %H:%M")
     plot_irradiance_with_marginal_means(
         frame_to_plot,
         start_index=(start_index := 24 * 31 * 6 + 48),
