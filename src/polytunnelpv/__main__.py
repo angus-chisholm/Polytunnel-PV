@@ -1203,78 +1203,86 @@ def main(unparsed_arguments) -> None:
     if not os.path.exists(output_directory):
         os.makedirs(output_directory)
     
-    # Check if output file already exists:
-    output_file = os.path.join(output_directory, f"mpp_daily_summary_{scenario.name}.xlsx")
-    if os.path.exists(output_file):
-        print(f"Output file {output_file} already exists. Skipping computation.")
-    
-    else:
-        # Use joblib to parallelize the for loop
-        start_time = time.time()
-        with tqdm(
-            desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
-        ) as pbar:
-            # with ThreadPool(8) as mpool:
-            #     results_map = mpool.map(
-            #         functools.partial(
-            #             process_single_mpp_calculation,
-            #             irradiance_frame=irradiance_frame,
-            #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-            #             pbar=pbar,
-            #             pv_system=pv_system,
-            #             scenario=scenario,
-            #         ),
-            #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
-            #     )
-
-            results = Parallel(n_jobs=8)(
-                delayed(
-                    functools.partial(
-                        process_single_mpp_calculation_without_pbar,
-                        irradiance_frame=irradiance_frame,
-                        locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-                        pv_system=pv_system,
-                        scenario=scenario,
+    # Check if data has already been processed for each scenario
+    for scenario in scenarios:
+        if not os.path.isfile(
+            (
+                mpp_filename := os.path.join(
+                    output_directory, f"mpp_daily_summary_{scenario.name}.xlsx"
                     )
-                )(time_of_day)
-                for time_of_day in range(
-                    parsed_args.start_day_index,
-                    parsed_args.start_day_index + parsed_args.iteration_length,
-                )
             )
+        ):
+            # Use joblib to parallelize the for loop
+            start_time = time.time()
+            with tqdm(
+                desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
+            ) as pbar:
+                # with ThreadPool(8) as mpool:
+                #     results_map = mpool.map(
+                #         functools.partial(
+                #             process_single_mpp_calculation,
+                #             irradiance_frame=irradiance_frame,
+                #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                #             pbar=pbar,
+                #             pv_system=pv_system,
+                #             scenario=scenario,
+                #         ),
+                #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
+                #     )
 
-        end_time = time.time()
-        print(f"Parallel processing took {end_time - start_time:.2f} seconds")
+                results = Parallel(n_jobs=8)(
+                    delayed(
+                        functools.partial(
+                            process_single_mpp_calculation_without_pbar,
+                            irradiance_frame=irradiance_frame,
+                            locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                            pv_system=pv_system,
+                            scenario=scenario,
+                        )
+                    )(time_of_day)
+                    for time_of_day in range(
+                        parsed_args.start_day_index,
+                        parsed_args.start_day_index + parsed_args.iteration_length,
+                    )
+                )
 
-        # Process results and accumulate daily data
-        all_mpp_data = []
+            end_time = time.time()
+            print(f"Parallel processing took {end_time - start_time:.2f} seconds")
 
-        for result in results:
-            if result is not None:
-                hour, mpp_power, date_str = result
-                if mpp_power is not None:
-                    daily_data[date_str].append((hour, mpp_power))
-                    all_mpp_data.append((date_str, hour, mpp_power))
+            # Process results and accumulate daily data
+            all_mpp_data = []
 
-        # Save daily data to a single Excel file with separate sheets
-        with pd.ExcelWriter(
-            os.path.join(output_directory, f"mpp_daily_summary_{scenario.name}.xlsx"),
-            engine="openpyxl",
-        ) as writer:
+            for result in results:
+                if result is not None:
+                    hour, mpp_power, date_str = result
+                    if mpp_power is not None:
+                        daily_data[date_str].append((hour, mpp_power))
+                        all_mpp_data.append((date_str, hour, mpp_power))
 
-            # Ensure at least one sheet is present and visible
-            workbook = writer.book
-            placeholder_sheet = workbook.create_sheet(title="Sheet1")
+            # Save daily data to a single Excel file with separate sheets
+            with pd.ExcelWriter(
+                mpp_filename,
+                engine="openpyxl",
+            ) as writer:
 
-            for date_str, data in daily_data.items():
-                df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
-                total_mpp = df["MPP (W)"].sum()
-                df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
-                df.to_excel(writer, sheet_name=date_str, index=False)
+                # Ensure at least one sheet is present and visible
+                workbook = writer.book
+                placeholder_sheet = workbook.create_sheet(title="Sheet1")
 
-            # Remove the placeholder sheet if it was not used
-            if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
-                del workbook["Sheet1"]
+                for date_str, data in daily_data.items():
+                    df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
+                    total_mpp = df["MPP (W)"].sum()
+                    df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
+                    df.to_excel(writer, sheet_name=date_str, index=True)
+
+                # Remove the placeholder sheet if it was not used
+                if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
+                    del workbook["Sheet1"]
+        else:
+            skipped = True
+            print(f"DEBUG: Skipping MPP calculation for {scenario.name} as output file already exists.")
+
+        
     
 
     # #TODO:
@@ -1292,7 +1300,7 @@ def main(unparsed_arguments) -> None:
             1000
             * irradiance_frame.set_index("hour")
             .iloc[(plotting_time_of_day := 4812)]
-            .values[pv_cell.cell_id]# + 1]
+            .values[pv_cell.cell_id]
             for pv_cell in scenario.pv_module.pv_cells
         ],
         color="orange",
@@ -1303,7 +1311,7 @@ def main(unparsed_arguments) -> None:
     plt.xlabel("Cell ID")
     plt.ylabel("Irradiance / W/m$^2$")
     plt.savefig(
-        f"irradiance_graph_{scenario.name}_{plotting_time_of_day}.{(fig_format:='pdf')}",
+        f"{output_directory}/irradiance_graph_{scenario.name}_{plotting_time_of_day}.{(fig_format:='pdf')}",
         # transparent=True,
         format=fig_format,
         # dpi=300,
@@ -1322,7 +1330,7 @@ def main(unparsed_arguments) -> None:
                 1000
                 * irradiance_frame.set_index("hour")
                 .iloc[plotting_time_of_day]
-                .iloc[pv_cell.cell_id],# + 1],
+                .iloc[pv_cell.cell_id],
                 0,
             )
             - 273.15
@@ -1337,7 +1345,7 @@ def main(unparsed_arguments) -> None:
     plt.xlabel("Cell ID")
     plt.ylabel("Temperature / Degrees Celsius")
     plt.savefig(
-        f"temperature_graph_{scenario.name}_{plotting_time_of_day}.{fig_format}",
+        f"{output_directory}/temperature_graph_{scenario.name}_{plotting_time_of_day}.{fig_format}",
         transparent=True,
         format="png",
         dpi=300,
@@ -1391,10 +1399,6 @@ def main(unparsed_arguments) -> None:
     axes[2, 1].set_visible(False)
     y_label_coord: int = int(-850)
 
-    # axes[0, 0].get_shared_x_axes().join(axes[0, 0], axes[1, 0])
-    # axes[3, 0].get_shared_x_axes().join(axes[3, 0], axes[4, 0])
-    # axes[3, 1].get_shared_x_axes().join(axes[3, 1], axes[4, 1])
-    # axes[0, 1].get_shared_x_axes().join(axes[0, 1], axes[1, 1])
     axes[1, 0].sharex(axes[0, 0])
     axes[4, 0].sharex(axes[3, 0])
     axes[4, 1].sharex(axes[3, 1])
@@ -1484,6 +1488,7 @@ def main(unparsed_arguments) -> None:
     )
     plt.xlabel("Cell index within panel")
     plt.ylabel("Hour of the day")
+    plt.title(f"Cell irradiance on {start_index // 24 + 1}st day of the year")
     plt.show()
     
     pdb.set_trace()
