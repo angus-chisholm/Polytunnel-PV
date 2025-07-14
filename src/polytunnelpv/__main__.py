@@ -702,11 +702,8 @@ def process_single_mpp_calculation_without_pbar(
         date_str = date.strftime("%d_%b_%Y")
 
         max_irradiance = np.max(
-            irradiance_frame.set_index("hour").iloc[time_of_day]#[1:]
+            irradiance_frame.set_index("hour").iloc[time_of_day][1:]
         )
-        # print(f"DEBUG: t_o_d: {time_of_day}, hr: {hour}, \
-        #     irradiance frame tod: {irradiance_frame.iloc[time_of_day]}, \
-        #     irradiance frame hour: {irradiance_frame.iloc[hour]}")
 
         if max_irradiance == 0:
             return hour, 0, date_str
@@ -739,7 +736,7 @@ def process_single_mpp_calculation_without_pbar(
                 ],
                 1000
                 * irradiance_frame.set_index("hour")
-                .iloc[time_of_day]#[1:]
+                .iloc[time_of_day][1:]
                 .reset_index(drop=True),
                 current_series=current_series,
             )
@@ -850,7 +847,7 @@ def plot_irradiance_with_marginal_means(
 
     joint_plot_grid.ax_joint.set_xlabel("Mean angle from polytunnel axis")
     joint_plot_grid.ax_joint.set_ylabel("Hour of the day")
-    joint_plot_grid.ax_joint.set_title(initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y")
+    joint_plot_grid.ax_joint.set_title((initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y"))
     joint_plot_grid.ax_joint.legend().remove()
 
     # Remove ticks from axes
@@ -951,7 +948,6 @@ def main(unparsed_arguments) -> None:
 
     # Parse the command-line arguments.
     parsed_args = _parse_args(unparsed_arguments)
-    print(f"DEBUG: parsed_args.start_day_index = {parsed_args.start_day_index}, parsed_args.iteration_length = {parsed_args.iteration_length}")
 
     # Parse all of the input files
     print(
@@ -963,6 +959,13 @@ def main(unparsed_arguments) -> None:
     locations = _parse_locations()
     polytunnels = _parse_polytunnel_curves()
     user_defined_pv_cells = _parse_cells()
+    # Extract variables for each cell
+    for cell in user_defined_pv_cells:
+        I0 = cell["I_o_ref"]
+        IL = cell["I_L_ref"]
+        nNsVth = cell["N_s"]
+        Rs = cell["R_s"]
+        Rsh = cell["R_sh_ref"]
     pv_modules = _parse_pv_modules(
         {polytunnel.name: polytunnel for polytunnel in polytunnels},
         {entry[NAME]: entry for entry in user_defined_pv_cells},
@@ -1124,13 +1127,15 @@ def main(unparsed_arguments) -> None:
                     for pv_cell in scenario.pv_module.pv_cells
                 ] + ["hour"]
 
+                combined_frame = combined_frame.reset_index().rename(columns={"index": (date_and_time := "date_and_time")})
+                
                 with open(
                     os.path.join(
                         "auto_generated", f"{scenario.name}_cellwise_irradiance.csv"
                     ),
                     "w",
                 ) as f:
-                    combined_frame.to_csv(f, index=None)
+                    combined_frame.to_csv(f, index=False)
 
             cellwise_irradiance_frames.append((scenario, combined_frame))
 
@@ -1139,7 +1144,7 @@ def main(unparsed_arguments) -> None:
             break
 
     if skipped:
-        print("DEBUG: Skipping calculation of irradiance and using irradiance from file")
+        print("Skipping calculation of irradiance and using irradiance from file")
 
         cellwise_irradiance_frames = []
 
@@ -1151,7 +1156,7 @@ def main(unparsed_arguments) -> None:
                 "r",
             ) as f:
                 combined_frame = pd.read_csv(f, index_col=None)
-                print(combined_frame.head(5))
+                
 
             combined_frame.columns = pd.Index([(date_and_time:="date_and_time")] + list(combined_frame.columns)[1:])
             cellwise_irradiance_frames.append((scenario, combined_frame.copy()))
@@ -1183,7 +1188,7 @@ def main(unparsed_arguments) -> None:
         irradiance_frame = [
             entry[1] for entry in cellwise_irradiance_frames if entry[0] == scenario
         ][0]
-        print(f"DEBUG: irradiance frame {irradiance_frame.iloc[0:25,:2]}")
+        #print(f"DEBUG: irradiance frame {irradiance_frame.iloc[0:25,:3]}")
     except IndexError:
         raise Exception("Internal error occurred.") from None
 
@@ -1208,7 +1213,8 @@ def main(unparsed_arguments) -> None:
     if not os.path.isfile(
         (
             mpp_filename := os.path.join(
-                output_directory, f"mpp_daily_summary_{scenario.name}.xlsx"
+                output_directory, f"mpp_daily_summary_{scenario.name}_\
+                    {parsed_args.start_day_index}_{parsed_args.iteration_length}.xlsx"
                 )
         )
     ):
@@ -1273,18 +1279,16 @@ def main(unparsed_arguments) -> None:
                 df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
                 total_mpp = df["MPP (W)"].sum()
                 df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
-                df.to_excel(writer, sheet_name=date_str, index=True)
+                df.to_excel(writer, sheet_name=date_str, index=False)
 
             # Remove the placeholder sheet if it was not used
             if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
                 del workbook["Sheet1"]
     else:
-        skipped = True
-        print(f"DEBUG: Skipping MPP calculation for {scenario.name} as output file already exists.")
+        print(f"Skipping MPP calculation for {scenario.name} as output file already exists.")
 
         
     
-
     # #TODO:
     # # - Improve the speed of the calculation so it can be run for all hours.
     # # - Some way to store whether the cells have been bypassed.
@@ -1300,7 +1304,7 @@ def main(unparsed_arguments) -> None:
             1000
             * irradiance_frame.set_index("hour")
             .iloc[(plotting_time_of_day := 4812)]
-            .values[pv_cell.cell_id]
+            .values[pv_cell.cell_id+1]
             for pv_cell in scenario.pv_module.pv_cells
         ],
         color="orange",
@@ -1330,7 +1334,7 @@ def main(unparsed_arguments) -> None:
                 1000
                 * irradiance_frame.set_index("hour")
                 .iloc[plotting_time_of_day]
-                .iloc[pv_cell.cell_id],
+                .iloc[pv_cell.cell_id+1],
                 0,
             )
             - 273.15
@@ -1404,19 +1408,30 @@ def main(unparsed_arguments) -> None:
     axes[4, 1].sharex(axes[3, 1])
     axes[1, 1].sharex(axes[0, 1])
     
-
+    # plug the parameters into the SDE and solve for IV curves:
+    SDE_params = {
+        'photocurrent': IL,
+        'saturation_current': I0,
+        'resistance_series': Rs,
+        'resistance_shunt': Rsh,
+        'nNsVth': nNsVth
+    }
+    curve_info = pvlib.pvsystem.singlediode(method='lambertw', **SDE_params)
+    v = pd.DataFrame(np.linspace(0., curve_info['v_oc'], 100))
+    i = pd.DataFrame(pvlib.pvsystem.i_from_v(voltage=v, method='lambertw', **SDE_params))
+    plt.plot(v, i)
+    plt.show()
     # curve_info = pvlib.pvsystem.singlediode(
     #     photocurrent=IL,
     #     saturation_current=I0,
     #     resistance_series=Rs,
     #     resistance_shunt=Rsh,
     #     nNsVth=nNsVth,
-    #     ivcurve_pnts=100,
+    #     #ivcurve_pnts=100,
     #     method="lambertw",
     # )
-    #plt.plot(curve_info["v"], curve_info["i"])
-    plt.axhline(1, color="grey", linestyle="--", linewidth=0.5, alpha=0.5)
-    plt.show()
+    # plt.plot(curve_info["v_oc"], curve_info["i"])
+    # plt.show()
 
     # pvlib.singlediode.bishop88_i_from_v(
     #     -14.95,
@@ -1449,6 +1464,14 @@ def main(unparsed_arguments) -> None:
     #     nNsVth=nNsVth,
     #     breakdown_voltage=-15,
     # )
+    
+    # plt.plot(ivcurve_v, ivcurve_i, label="IV Curve")
+    # plt.xlabel("Voltage (V)")
+    # plt.ylabel("Current (A)")
+    # plt.title("IV Curve")
+    # plt.legend()
+    # plt.grid()
+    # plt.show()
 
     # Determine the scenario index
     try:
@@ -1496,6 +1519,7 @@ def main(unparsed_arguments) -> None:
     frame_to_plot = cellwise_irradiance_frames[scenario_index][1]
     date_and_time_series = frame_to_plot.pop(date_and_time)
     initial_time = datetime.strptime(str(date_and_time_series.iloc[0]), "%Y-%m-%d %H:%M")
+   
     plot_irradiance_with_marginal_means(
         frame_to_plot,
         start_index=(start_index := 24 * 31 * 6 + 48),
