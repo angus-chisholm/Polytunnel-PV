@@ -36,6 +36,7 @@ import sys
 import time
 import warnings
 import yaml
+import pdb
 
 from datetime import datetime, timedelta
 from collections import defaultdict
@@ -708,7 +709,7 @@ def process_single_mpp_calculation_without_pbar(
         hour = time_of_day % 24
         date = datetime(2023, 1, 1) + timedelta(hours=time_of_day)
         date_str = date.strftime("%d_%b_%Y")
-
+        
         max_irradiance = np.max(
             irradiance_frame.set_index("hour").iloc[time_of_day][1:]
         )
@@ -753,7 +754,7 @@ def process_single_mpp_calculation_without_pbar(
             individual_power_extreme = max(
                 individual_power_extreme, max(abs(power_series))
             )
-
+        
         combined_power_series = sum(cell_to_power_map.values())
         combined_voltage_series = sum(cell_to_voltage_map.values())
         combined_power_series = pv_system.combine_powers(combined_power_series)
@@ -1072,7 +1073,7 @@ def main(unparsed_arguments) -> None:
         + " ",
         end="",
     )
-    skipped: bool = False
+    skipped: dict[Scenario.name,bool] = dict(zip([scenario.name for scenario in scenarios],[False for scenario in scenarios]))
     for scenario in scenarios:
         cellwise_irradiances = []
         if not os.path.isfile(
@@ -1149,10 +1150,11 @@ def main(unparsed_arguments) -> None:
             cellwise_irradiance_frames.append((scenario, combined_frame))
 
         else:
-            skipped = True
-            break
+            skipped[scenario.name] = True
+            continue
+            
 
-    if skipped:
+    if all(skipped.values()):
         print("Skipping calculation of irradiance and using irradiance from file")
 
         cellwise_irradiance_frames = []
@@ -1211,6 +1213,21 @@ def main(unparsed_arguments) -> None:
 
     # Fix nan errors:
     irradiance_frame = irradiance_frame.fillna(0)
+    
+    # print(irradiance_frame.iloc[-48:,-3:])
+    
+    # # Check for invalid start date or iteration length values:
+    # try:
+    #     print(irradiance_frame.iloc[parsed_args.start_day_index])
+    #     print(irradiance_frame.iloc[parsed_args.start_day_index+parsed_args.iteration_length])
+        
+    # except IndexError:
+    #     raise IndexError(
+    #         "Start day and iteration length combination not possible, index out of bounds."
+    #     ) from None
+    
+    # print(locations_to_weather_and_solar_map[scenario.location])
+        
 
     daily_data = defaultdict(list)
 
@@ -1481,188 +1498,188 @@ def main(unparsed_arguments) -> None:
 #     # plt.grid()
 #     # plt.show()
 
-#     # Determine the scenario index
-#     try:
-#         scenario_index: int = [
-#             index
-#             for index, scenario in enumerate(scenarios)
-#             if scenario.name == parsed_args.scenario
-#         ][0]
-#     except IndexError:
-#         raise IndexError(
-#             "Unable to find current scenario weather information."
-#         ) from None
+    # # Determine the scenario index
+    # try:
+    #     scenario_index: int = [
+    #         index
+    #         for index, scenario in enumerate(scenarios)
+    #         if scenario.name == parsed_args.scenario
+    #     ][0]
+    # except IndexError:
+    #     raise IndexError(
+    #         "Unable to find current scenario weather information."
+    #     ) from None
 
-#     frame_slice = (
-#         cellwise_irradiance_frames[scenario_index][1]
-#         .iloc[(start_index:=parsed_args.start_day_index) : start_index + 24]
-#         .set_index("hour")
-#     )
-#     frame_slice.pop(date_and_time)
-#     sns.heatmap(
-#         frame_slice,
-#         cmap=sns.blend_palette(
-#             [
-#                 "#144E56",
-#                 "#28769C",
-#                 "teal",
-#                 "#94B49F",
-#                 "grey",
-#                 "silver",
-#                 "orange",
-#                 "#E04606",
-#             ],
-#             as_cmap=True,
-#         ),
-#         vmin=0,
-#         cbar_kws={"label": "Irradiance / kWm$^{-2}$"},
-#     )
-#     plt.xlabel("Cell index within panel")
-#     plt.ylabel("Hour of the day")
-#     plt.title(f"Cell irradiance on {start_index // 24 + 1}st day of the year")
-#     plt.show()
+    # frame_slice = (
+    #     cellwise_irradiance_frames[scenario_index][1]
+    #     .iloc[(start_index:=parsed_args.start_day_index) : start_index + 24]
+    #     .set_index("hour")
+    # )
+    # frame_slice.pop(date_and_time)
+    # sns.heatmap(
+    #     frame_slice,
+    #     cmap=sns.blend_palette(
+    #         [
+    #             "#144E56",
+    #             "#28769C",
+    #             "teal",
+    #             "#94B49F",
+    #             "grey",
+    #             "silver",
+    #             "orange",
+    #             "#E04606",
+    #         ],
+    #         as_cmap=True,
+    #     ),
+    #     vmin=0,
+    #     cbar_kws={"label": "Irradiance / kWm$^{-2}$"},
+    # )
+    # plt.xlabel("Cell index within panel")
+    # plt.ylabel("Hour of the day")
+    # plt.title(f"Cell irradiance on {start_index // 24 + 1} day of the year")
+    # plt.show()
     
-#     pdb.set_trace()
+    # pdb.set_trace()
 
-#     frame_to_plot = cellwise_irradiance_frames[scenario_index][1]
-#     date_and_time_series = frame_to_plot.pop(date_and_time)
-#     initial_time = datetime.strptime(str(date_and_time_series.iloc[0]), "%Y-%m-%d %H:%M")
+    # frame_to_plot = cellwise_irradiance_frames[scenario_index][1]
+    # date_and_time_series = frame_to_plot.pop(date_and_time)
+    # initial_time = datetime.strptime(str(date_and_time_series.iloc[0]), "%Y-%m-%d %H:%M")
    
-#     plot_irradiance_with_marginal_means(
-#         frame_to_plot,
-#         start_index=(start_index := 24 * 31 * 6 + 48),
-#         figname=f"{scenario.name}_{parsed_args.start_day_index}_small_panel",
-#         heatmap_vmax=(
-#             heatmap_vmax := frame_to_plot
-#             .set_index("hour")
-#             .iloc[start_index : start_index + 24]
-#             .max()
-#             .max()
-#         ),
-#         initial_date=initial_time,
-#         irradiance_bar_vmax=(
-#             irradiance_bar_vmax := (
-#                 max(
-#                     frame_to_plot
-#                     .set_index("hour")
-#                     .iloc[start_index : start_index + 24]
-#                     .mean(axis=1)
-#                     .max(),
-#                     0,
-#                     # cellwise_irradiance_frames[1][1]
-#                     # .set_index("hour")
-#                     # .iloc[start_index : start_index + 24]
-#                     # .mean(axis=1)
-#                     # .max(),
-#                     # cellwise_irradiance_frames[2][1]
-#                     # .set_index("hour")
-#                     # .iloc[start_index : start_index + 24]
-#                     # .mean(axis=1)
-#                     # .max(),
-#                 )
-#             )
-#         ),
-#         irradiance_scatter_vmin=0,
-#         irradiance_scatter_vmax=(
-#             irradiance_scatter_vmax := 1.25
-#             * (
-#                 max(
-#                     frame_to_plot
-#                     .set_index("hour")
-#                     .iloc[start_index : start_index + 24]
-#                     .mean(axis=0)
-#                     .max(),
-#                     0,
-#                     # cellwise_irradiance_frames[1][1]
-#                     # .set_index("hour")
-#                     # .iloc[start_index : start_index + 24]
-#                     # .sum(axis=0)
-#                     # .max(),
-#                     # cellwise_irradiance_frames[2][1]
-#                     # .set_index("hour")
-#                     # .iloc[start_index : start_index + 24]
-#                     # .sum(axis=0)
-#                     # .max(),
-#                 )
-#             )
-#         ),
-#     )
+    # plot_irradiance_with_marginal_means(
+    #     frame_to_plot,
+    #     start_index=(start_index := 24 * 31 * 6 + 48),
+    #     figname=f"{scenario.name}_{parsed_args.start_day_index}_small_panel",
+    #     heatmap_vmax=(
+    #         heatmap_vmax := frame_to_plot
+    #         .set_index("hour")
+    #         .iloc[start_index : start_index + 24]
+    #         .max()
+    #         .max()
+    #     ),
+    #     initial_date=initial_time,
+    #     irradiance_bar_vmax=(
+    #         irradiance_bar_vmax := (
+    #             max(
+    #                 frame_to_plot
+    #                 .set_index("hour")
+    #                 .iloc[start_index : start_index + 24]
+    #                 .mean(axis=1)
+    #                 .max(),
+    #                 0,
+    #                 # cellwise_irradiance_frames[1][1]
+    #                 # .set_index("hour")
+    #                 # .iloc[start_index : start_index + 24]
+    #                 # .mean(axis=1)
+    #                 # .max(),
+    #                 # cellwise_irradiance_frames[2][1]
+    #                 # .set_index("hour")
+    #                 # .iloc[start_index : start_index + 24]
+    #                 # .mean(axis=1)
+    #                 # .max(),
+    #             )
+    #         )
+    #     ),
+    #     irradiance_scatter_vmin=0,
+    #     irradiance_scatter_vmax=(
+    #         irradiance_scatter_vmax := 1.25
+    #         * (
+    #             max(
+    #                 frame_to_plot
+    #                 .set_index("hour")
+    #                 .iloc[start_index : start_index + 24]
+    #                 .mean(axis=0)
+    #                 .max(),
+    #                 0,
+    #                 # cellwise_irradiance_frames[1][1]
+    #                 # .set_index("hour")
+    #                 # .iloc[start_index : start_index + 24]
+    #                 # .sum(axis=0)
+    #                 # .max(),
+    #                 # cellwise_irradiance_frames[2][1]
+    #                 # .set_index("hour")
+    #                 # .iloc[start_index : start_index + 24]
+    #                 # .sum(axis=0)
+    #                 # .max(),
+    #             )
+    #         )
+    #     ),
+    # )
 
-#     # # Calcualte the MPP of the PV system for each of the horus to be modelled.
-#     # if parsed_args.timestamps_file is None:
-#     #     raise ArgumentError(
-#     #         "Cannot carry out hourly calculation without timestamps file."
-#     #     )
+    # # Calcualte the MPP of the PV system for each of the horus to be modelled.
+    # if parsed_args.timestamps_file is None:
+    #     raise ArgumentError(
+    #         "Cannot carry out hourly calculation without timestamps file."
+    #     )
 
-#     # # Open the timestamps file.
-#     # try:
-#     #     with open(parsed_args.timestamps_file, "r") as f:
-#     #         timestamps_data = pd.read_csv(f, index_col="timestamp")
-#     # except FileNotFoundError:
-#     #     raise FileNotFoundError(
-#     #         f"Could not find timestamps file: {parsed_args.timestamps_file}"
-#     #     )
+    # # Open the timestamps file.
+    # try:
+    #     with open(parsed_args.timestamps_file, "r") as f:
+    #         timestamps_data = pd.read_csv(f, index_col="timestamp")
+    # except FileNotFoundError:
+    #     raise FileNotFoundError(
+    #         f"Could not find timestamps file: {parsed_args.timestamps_file}"
+    #     )
 
-#     # # Compute the start time within the year based on the time stamp if not provided.
-#     # if (_start_time_column_name := "start_time") not in timestamps_data.columns:
-#     #     timestamps_data[_start_time_column_name] = [
-#     #         (
-#     #             datetime.datetime.combine(
-#     #                 datetime.date(
-#     #                     year=int(entry[0].split(" ")[0].split("/")[2]),
-#     #                     month=int(entry[0].split(" ")[0].split("/")[1]),
-#     #                     day=int(entry[0].split(" ")[0].split("/")[0]),
-#     #                 ),
-#     #                 datetime.time(hour=int(entry[0].split(" ")[1].split(":")[0])),
-#     #             )
-#     #             - datetime.datetime(year=2023, month=1, day=1, hour=0, minute=0)
-#     #         ).total_seconds()
-#     #         / 3600
-#     #         for entry in timestamps_data.iterrows()
-#     #     ]
+    # # Compute the start time within the year based on the time stamp if not provided.
+    # if (_start_time_column_name := "start_time") not in timestamps_data.columns:
+    #     timestamps_data[_start_time_column_name] = [
+    #         (
+    #             datetime.datetime.combine(
+    #                 datetime.date(
+    #                     year=int(entry[0].split(" ")[0].split("/")[2]),
+    #                     month=int(entry[0].split(" ")[0].split("/")[1]),
+    #                     day=int(entry[0].split(" ")[0].split("/")[0]),
+    #                 ),
+    #                 datetime.time(hour=int(entry[0].split(" ")[1].split(":")[0])),
+    #             )
+    #             - datetime.datetime(year=2023, month=1, day=1, hour=0, minute=0)
+    #         ).total_seconds()
+    #         / 3600
+    #         for entry in timestamps_data.iterrows()
+    #     ]
 
-#     # # For each hour within the series of start times, compute the MPP.
-#     # mpp_current_map: dict[int, float] = {}
-#     # mpp_power_map: dict[int, float] = {}
-#     # for start_index in tqdm(
-#     #     timestamps_data[_start_time_column_name],
-#     #     desc="Computing hourly MPP",
-#     #     leave=True,
-#     #     unit="hour",
-#     # ):
-#     #     individual_power_extreme: float = 0
-#     #     for pv_cell in tqdm(
-#     #         scenario.pv_module.pv_cells_and_cell_strings,
-#     #         desc="Cellwise calculation",
-#     #         leave=False,
-#     #         unit="cell",
-#     #     ):
-#     #         # Skip if there's no irradiance.
-#     #         if any(irradiance_frame.set_index("hour").iloc[int(start_index)].isna()):
-#     #             continue
-#     #         # Determine the cell curves.
-#     #         current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
-#     #             locations_to_weather_and_solar_map[scenario.location][int(start_index)][
-#     #                 TEMPERATURE
-#     #             ],
-#     #             1000 * irradiance_frame.set_index("hour").iloc[int(start_index)],
-#     #             current_series=current_series,
-#     #         )
-#     #         cell_to_power_map[pv_cell] = power_series
-#     #         cell_to_voltage_map[pv_cell] = voltage_series
-#     #     # Combine the series across each individual module
-#     #     combined_power_series = sum(cell_to_power_map.values())
-#     #     combined_voltage_series = sum(cell_to_voltage_map.values())
+    # # For each hour within the series of start times, compute the MPP.
+    # mpp_current_map: dict[int, float] = {}
+    # mpp_power_map: dict[int, float] = {}
+    # for start_index in tqdm(
+    #     timestamps_data[_start_time_column_name],
+    #     desc="Computing hourly MPP",
+    #     leave=True,
+    #     unit="hour",
+    # ):
+    #     individual_power_extreme: float = 0
+    #     for pv_cell in tqdm(
+    #         scenario.pv_module.pv_cells_and_cell_strings,
+    #         desc="Cellwise calculation",
+    #         leave=False,
+    #         unit="cell",
+    #     ):
+    #         # Skip if there's no irradiance.
+    #         if any(irradiance_frame.set_index("hour").iloc[int(start_index)].isna()):
+    #             continue
+    #         # Determine the cell curves.
+    #         current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
+    #             locations_to_weather_and_solar_map[scenario.location][int(start_index)][
+    #                 TEMPERATURE
+    #             ],
+    #             1000 * irradiance_frame.set_index("hour").iloc[int(start_index)],
+    #             current_series=current_series,
+    #         )
+    #         cell_to_power_map[pv_cell] = power_series
+    #         cell_to_voltage_map[pv_cell] = voltage_series
+    #     # Combine the series across each individual module
+    #     combined_power_series = sum(cell_to_power_map.values())
+    #     combined_voltage_series = sum(cell_to_voltage_map.values())
 
-#     #     # Combine the series across the modules within the system.
-#     #     combined_power_series = pv_system.combine_powers(combined_power_series)
-#     #     combined_voltage_series = pv_system.combine_voltages(combined_voltage_series)
-#     #     combined_current_series = pv_system.combine_currents(current_series)
+    #     # Combine the series across the modules within the system.
+    #     combined_power_series = pv_system.combine_powers(combined_power_series)
+    #     combined_voltage_series = pv_system.combine_voltages(combined_voltage_series)
+    #     combined_current_series = pv_system.combine_currents(current_series)
 
-#     #     # Determine the maximum power point
-#     #     maximum_power_index = pd.Series(combined_power_series).idxmax()
-#     #     mpp_current_map[start_index] = combined_current_series[maximum_power_index]
-#     #     mpp_power_map[start_index] = combined_power_series[maximum_power_index]
+    #     # Determine the maximum power point
+    #     maximum_power_index = pd.Series(combined_power_series).idxmax()
+    #     mpp_current_map[start_index] = combined_current_series[maximum_power_index]
+    #     mpp_power_map[start_index] = combined_power_series[maximum_power_index]
 
 #     # import pdb
 
