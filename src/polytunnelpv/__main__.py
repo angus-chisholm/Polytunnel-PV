@@ -58,6 +58,7 @@ from .pv_module.pv_cell import (
     get_irradiance,
     PVCell,
     relabel_cell_electrical_parameters,
+    calculate_cell_iv_curve,
 )
 from .pv_module.pv_module import (
     Curve,
@@ -670,6 +671,8 @@ def process_single_mpp_calculation_without_pbar(
     ],
     pv_system: PVSystem,
     scenario: Scenario,
+    voltage_interp_array: np.ndarray | None,
+    param_grid: np.ndarray| None,
 ) -> tuple[int, float, str]:
     """
     Process the MPP calculation for a single hour of the simulation.
@@ -689,6 +692,12 @@ def process_single_mpp_calculation_without_pbar(
 
     :param: scenario
         The current :class:`Scenario` being modelled.
+        
+    :param: voltage_interp_array
+        The array used to interpolate values for voltage curves.
+        
+    :param: param_grid
+        The array of irradiance and temperature values used to calculate the voltage curves
 
     :return:
         - A `tuple` containing:
@@ -696,15 +705,7 @@ def process_single_mpp_calculation_without_pbar(
             - The MPP power achieved,
             - The date-time information.
 
-    """
-    # import sys
-    # def trace_worker(frame, event, arg):
-    #     if event == 'call':
-    #         print(f"WORKER -> {frame.f_code.co_name}() in {frame.f_code.co_filename.split('/')[-1]}:{frame.f_lineno}")
-    #     return trace_worker
-    
-    # sys.settrace(trace_worker)
-    
+    """    
     try:
         hour = time_of_day % 24
         date = datetime(2023, 1, 1) + timedelta(hours=time_of_day)
@@ -739,7 +740,17 @@ def process_single_mpp_calculation_without_pbar(
             desc="IV calculation",
             leave=False,
         ):
-            current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
+            # current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
+            #     locations_to_weather_and_solar_map[scenario.location][time_of_day][
+            #         TEMPERATURE
+            #     ],
+            #     1000
+            #     * irradiance_frame.set_index("hour")
+            #     .iloc[time_of_day][1:]
+            #     .reset_index(drop=True),
+            #     current_series=current_series,
+            # )
+            current_series, power_series, voltage_series = pv_cell.calculate_iv_curve_interpolation(
                 locations_to_weather_and_solar_map[scenario.location][time_of_day][
                     TEMPERATURE
                 ],
@@ -748,6 +759,8 @@ def process_single_mpp_calculation_without_pbar(
                 .iloc[time_of_day][1:]
                 .reset_index(drop=True),
                 current_series=current_series,
+                voltage_interp_array=voltage_interp_array,
+                param_grid=param_grid,
             )
             cell_to_power_map[pv_cell] = power_series
             cell_to_voltage_map[pv_cell] = voltage_series
@@ -932,6 +945,142 @@ def save_daily_results(date_str, data, scenario_name):
         # Remove the placeholder sheet if it was not used
         if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
             del workbook["Sheet1"]
+
+def create_voltage_interpolating_array(
+    *,
+    irradiance_points: np.ndarray,
+    temperature_points: np.ndarray,
+    scenario: Scenario,
+) -> np.ndarray:
+    """
+    Generate the interpolation array for voltage.
+
+    :param: irradiance_points
+        The irradiance points that will get used for generation.
+        
+    :param: temperature_points
+        The temperature points that will get used for generation.
+
+    :param: scenario
+        The current :class:`Scenario` being modelled.
+
+    :return:
+        - An array containing voltage series for every point in the meshgrid created with irradiance and temp points.
+        - An array containing the meshgrid values for the irradiances and temperatures caluculated.
+
+    """
+    # Create meshgrid and pvcell object for use in params
+    temp_grid, irrad_grid = np.meshgrid(temperature_points,irradiance_points, indexing='xy')
+    pv_cell_used = scenario.pv_module.pv_cells_and_cell_strings[0]
+    if type(pv_cell_used) == BypassedCellString:
+        pv_cell_used = scenario.pv_module.pv_cells_and_cell_strings[0].pv_cells[0]
+        
+    
+    
+    current_series = np.linspace(
+            0,
+            1.1
+            * max(
+                [
+                    pv_cell.short_circuit_current
+                    for pv_cell in scenario.pv_module.pv_cells
+                ]
+            ),
+            VOLTAGE_RESOLUTION,
+        )
+    
+    # Generate params for all variations in mesh
+    _calculated_pv_cell_params = pvlib.pvsystem.calcparams_desoto(
+            irrad_grid,
+            temp_grid,
+            pv_cell_used.alpha_sc,
+            pv_cell_used.a_ref,
+            pv_cell_used.j_l_ref,
+            pv_cell_used.j_o_ref,
+            pv_cell_used.r_sh_ref,
+            pv_cell_used.r_s,
+            pv_cell_used.eg_ref,
+            pv_cell_used.d_eg_dt_ref,
+        )
+    
+    
+    # Calculate voltage series for all mesh values
+    voltage_series = [modified_bishop_voltage_wrapper_function(
+                        #pv_cell_used,
+                        current,
+                        *_calculated_pv_cell_params,
+                        breakdown_voltage=pv_cell_used.breakdown_voltage,
+                        breakdown_factor=2e-3,
+                        breakdown_exp=3,
+                    )
+                    for current in (
+                        current_series  # type: ignore [union-attr]
+                    )
+                ]
+    #print([volt[0,0] for volt in voltage_series])
+    
+    # Ensure if wrapper function returned zero, we return an array of zeros
+    for i,volt in enumerate(voltage_series):
+        if not isinstance(volt,int):
+            series_shape = np.shape(volt)
+            break
+    for i,volt in enumerate(voltage_series):
+        if isinstance(volt,int):
+            voltage_series[i] = np.zeros(shape = series_shape)
+
+    voltage_series = np.asarray(voltage_series)/pv_cell_used.num_cells_in_parent_module
+    
+    # fig,ax = plt.subplots()
+    # ax.set_xlabel("Voltage")
+    # ax.set_ylabel("Current")
+    # volt_plot = [volt[50,5] for volt in voltage_series]
+    # ax.plot(volt_plot,current_series,label='current',color = 'green')
+    # ax2 = ax.twinx()
+    # ax2.set_ylabel("Power")
+    # ax2.plot(volt_plot,volt_plot*current_series,label='power',color='red')
+    # fig.legend()
+    # fig.show()
+
+    return np.stack(voltage_series,axis=-1), np.stack([irrad_grid,temp_grid],axis=-1)
+
+def modified_bishop_voltage_wrapper_function(*args, **kwargs):
+        """
+        Function to wrap around the bishop 88 method.
+
+        The `pvlib.singlediode.bishop88_v_from_i` method throws `RuntimeError`s when
+        the current would result in a value that is out of bounds.
+        Rather than throw this error to the user, it is caught here, and infinities
+        are returned instead.
+
+        Return:
+            - The result of the call to `pvlib.singlediode.bishop88_v_from_i`,
+                provided that it's an allowed results;
+            - `np.inf` or `-np.inf` otherwise.
+
+        """
+
+        with warnings.catch_warnings():
+            warnings.filterwarnings("error")
+            try:
+                voltage = pvlib.singlediode.bishop88_v_from_i(*args, **kwargs)
+            except (RuntimeError, RuntimeWarning):
+                return 0
+            else:
+                original_shape = np.shape(voltage)
+                ravelled_voltage = voltage.ravel()
+                #print(ravelled_voltage[:20])
+                for index,v in enumerate(ravelled_voltage):
+                    if v > (
+                        module_breakdown_voltage := (
+                            -132*4#pv_cell_used.num_cells_in_parent_module * pv_cell_used.breakdown_voltage
+                        )
+                    ):
+                        ravelled_voltage[index] = v
+                        continue
+                    else:
+                        ravelled_voltage[index] = module_breakdown_voltage
+                voltage = ravelled_voltage.reshape(original_shape)
+                return voltage
 
 
 def main(unparsed_arguments) -> None:
@@ -1243,6 +1392,18 @@ def main(unparsed_arguments) -> None:
                 )
         )
     ):
+        # Calculate interpolation array
+        irradiance_spectrum = np.linspace(2,1500,101)
+        temperature_spectrum = np.linspace(5,80,51)
+        voltage_interp_array, param_grid = create_voltage_interpolating_array(
+                                    irradiance_points=irradiance_spectrum,
+                                    temperature_points=temperature_spectrum,
+                                    scenario=scenario,
+                                )   
+        print("Calculation of interpolation array....DONE")
+        
+        
+        
         # Use joblib to parallelize the for loop
         start_time = time.time()
         with tqdm(
@@ -1269,6 +1430,8 @@ def main(unparsed_arguments) -> None:
                         locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
                         pv_system=pv_system,
                         scenario=scenario,
+                        voltage_interp_array=voltage_interp_array,
+                        param_grid=param_grid,
                     )
                 )(time_of_day)
                 for time_of_day in range(

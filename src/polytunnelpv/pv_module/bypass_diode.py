@@ -9,7 +9,7 @@
 # Time created: 14:24:00                                                               #
 ########################################################################################
 """
-bypass_diode.py - The bypass-diodde module for Polytunnel-PV.
+bypass_diode.py - The bypass-diode module for Polytunnel-PV.
 
 This module provides functionality for the modelling of bypass diodes within PV modules.
 
@@ -141,6 +141,91 @@ class BypassedCellString:
             cell_to_iv_series[pv_cell] = pv_cell.calculate_iv_curve(
                 ambient_celsius_temperature,
                 irradiance_array,
+                current_density_series=current_density_series,
+                current_series=current_series,
+                voltage_series=voltage_series,
+            )
+
+        # Add up the voltage for each cell
+        combined_voltage_series = sum(
+            cell_to_iv_series[pv_cell][2] for pv_cell in self.pv_cells
+        )
+
+        # Determine the bypass-diode curve
+        bypass_diode_curve = self.bypass_diode.calculate_i_from_v(
+            combined_voltage_series
+        )
+
+        # Bypass based on the diode voltage.
+        combined_voltage_series = np.array(
+            [
+                max(entry, self.bypass_diode.bypass_voltage)
+                for entry in combined_voltage_series
+            ]
+        )
+
+        # Re-compute the combined power series.
+        combined_power_series = (
+            current_series := cell_to_iv_series[self.pv_cells[0]][0]
+        ) * combined_voltage_series
+
+        return current_series, combined_power_series, combined_voltage_series
+
+
+    def calculate_iv_curve_interpolation(
+        self,
+        ambient_celsius_temperature: float,
+        irradiance_array: np.ndarray,
+        voltage_interp_array: np.ndarray | None = None,
+        param_grid: np.ndarray | None = None,
+        *,
+        current_density_series: np.ndarray | None = None,
+        current_series: np.ndarray | None = None,
+        voltage_series: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Calculate the IV curve for the bypassed string of cells.
+
+        Inputs:
+            - ambient_celsius_temperature:
+                The ambient temperature, in degrees Celsius.
+            - irradiance_array:
+                The irradiance, in W/m^2, striking all the cells in the module.
+            - current_density_series:
+                If provided, the current-density series---the series of opints over which to
+                calculate the current an power output from the cell.
+            - current_series:
+                The series of current points over which to calculate the current and power
+                output from the cell.
+            - voltage_series:
+                The series of voltage points over which to calculate the current and power
+                output from the cell.
+
+        Returns:
+            - current_series:
+                The current values.
+            - power_series:
+                The power values.
+            - voltage_series:
+                The voltage series.
+
+        """
+
+        # Calculate the curves for each cell
+        cell_to_iv_series: dict[PVCell, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+        for pv_cell in tqdm(self.pv_cells, desc="Bypassed IV curves", leave=False):
+            # cell_to_iv_series[pv_cell] = pv_cell.calculate_iv_curve(
+            #     ambient_celsius_temperature,
+            #     irradiance_array,
+            #     current_density_series=current_density_series,
+            #     current_series=current_series,
+            #     voltage_series=voltage_series,
+            # )
+            cell_to_iv_series[pv_cell] = pv_cell.calculate_iv_curve_interpolation(
+                ambient_celsius_temperature,
+                irradiance_array,
+                voltage_interp_array=voltage_interp_array,
+                param_grid=param_grid,
                 current_density_series=current_density_series,
                 current_series=current_series,
                 voltage_series=voltage_series,

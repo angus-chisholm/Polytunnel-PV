@@ -735,8 +735,8 @@ class PVCell:
         self,
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
-        voltage_interp_array: np.ndarray,
-        param_grid,
+        voltage_interp_array: np.ndarray | None = None,
+        param_grid: np.ndarray | None = None,
         *,
         current_density_series: np.ndarray | None = None,
         current_series: np.ndarray | None = None,
@@ -779,6 +779,17 @@ class PVCell:
             )
             - ZERO_CELSIUS_OFFSET
         )
+        
+        if not isinstance(voltage_interp_array,np.ndarray) or not isinstance(param_grid,np.ndarray):
+            return calculate_cell_iv_curve(
+            cell_temperature,
+            solar_irradiance,
+            self,
+            current_density_series=current_density_series,
+            current_series=current_series,
+            voltage_series=voltage_series,
+        )
+        
         voltage_series = interpolate_voltage_curve(
             voltage_interp_array,
             param_grid,
