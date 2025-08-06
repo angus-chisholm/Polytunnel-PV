@@ -601,6 +601,57 @@ def _parse_pv_modules(
                         .to_dict()
                     )
                     PRE_LOADED_PV_CELLS[cell_type_name] = cell_electrical_parameters
+
+                    # match name:
+                    #     case "CdTe":
+                    #         PRE_LOADED_PV_CELLS[cell_type_name]["EgRef"] = 1.475
+
+                    #  Crystalline Silicon (Si):
+                    #      * EgRef = 1.121
+                    #      * dEgdT = -0.0002677
+
+                    #      >>> M = np.polyval([-1.26E-4, 2.816E-3, -0.024459, 0.086257, 0.9181],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [1]
+
+                    #  Cadmium Telluride (CdTe):
+                    #      * dEgdT = -0.0003
+
+                    #      >>> M = np.polyval([-2.46E-5, 9.607E-4, -0.0134, 0.0716, 0.9196],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [4]
+
+                    #  Copper Indium diSelenide (CIS):
+                    #      * EgRef = 1.010
+                    #      * dEgdT = -0.00011
+
+                    #      >>> M = np.polyval([-3.74E-5, 0.00125, -0.01462, 0.0718, 0.9210],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [4]
+
+                    #  Copper Indium Gallium diSelenide (CIGS):
+                    #      * EgRef = 1.15
+                    #      * dEgdT = ????
+
+                    #      >>> M = np.polyval([-9.07E-5, 0.0022, -0.0202, 0.0652, 0.9417],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: Wikipedia
+
+                    #  Gallium Arsenide (GaAs):
+                    #      * EgRef = 1.424
+                    #      * dEgdT = -0.000433
+                    #      * M = unknown
+
+                    #             except KeyError:
+                    #                 raise Exception(
+                    #                     f"Could not find cell name {cell_type_name} within either local or "
+                    #                     "pvlib-imported scope."
+                    #                 ) from None
+
                 except KeyError:
                     raise Exception(
                         f"Could not find cell name {cell_type_name} within either local or "
