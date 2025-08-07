@@ -15,13 +15,15 @@ This module provides functionality for the modelling of bypass diodes within PV 
 
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
+import pandas as pd
 
 from tqdm import tqdm
 
-from .pv_cell import PVCell
+from ..__utils__ import BOLTZMAN_CONSTANT, ELECTRON_CHARGE, VOLTAGE_RESOLUTION
+from .pv_cell import PVCell, ZERO_CELSIUS_OFFSET
 
 __all__ = ("BypassDiode", "BypassedCellString")
 
@@ -45,9 +47,57 @@ class BypassDiode:
     bypass_voltage: float
     end_index: int
     start_index: int
+    saturation_current: float = 1e-12
+    ideality_factor: float = 1.1
+    thermal_voltage: float = field(init=False)
 
-    def calculate_i_from_v(self, voltage: float | list[float]):
-        return 0.5
+    def __repr__(self) -> str:
+        """
+        Return a nice-looking representation of the bypass diode.
+
+        """
+
+        return (
+            f"BypassDiode(bypass_voltage={self.bypass_voltage}, "
+            f"start_index={self.start_index}), end_index={self.end_index}, "
+            f"saturation_current={self.saturation_current}, "
+            f"ideality_factor={self.ideality_factor})"
+        )
+
+    def calculate_i_from_v(self, voltage: float | list[float]) -> np.array:
+        """
+        Calculate the current based on the voltage using the Shockley diode equation.
+
+        :param: voltage
+            Either a single value or a list of values for which to calculate.
+
+        :returns: The current.
+
+        """
+
+        voltage = np.array(voltage)  # Ensure voltage is an array for vector operations
+        current = self.saturation_current * (
+            np.exp(-voltage / (self.ideality_factor * self.thermal_voltage)) - 1
+        )
+        return current
+
+    def calculate_v_from_i(self, current: float | list[float]) -> np.array:
+        """
+        Calculate the voltage based on the current using the Shockley diode equation.
+
+        :param: current
+            Either a single value or a list of values for which to calculate.
+
+        :returns: The voltage.
+
+        """
+
+        current = np.array(current)
+        voltage = -(self.ideality_factor * self.thermal_voltage) * np.log(
+            1 + current / self.saturation_current
+        )
+
+        return voltage
 
 
 @dataclass(kw_only=True)
@@ -98,53 +148,98 @@ class BypassedCellString:
 
         return hash(self.cell_id)
 
+    def set_bypass_diode_temperature(
+        self, ambient_celsius_temperature: float, irradiance_array: float
+    ) -> None:
+        """
+        Initialize the bypass diode parameters.
+
+        :param: ambient_celsius_temperature
+            The ambient temperature in degC.
+
+        :param: irradiance_array
+            The irradiance falling on the system.
+
+        """
+
+        # Calculate the average cell temperature for the set of cells being bypassed.
+        temperatures = [
+            pv_cell.average_cell_temperature(
+                ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
+                irradiance_array[pv_cell.cell_id],
+                0,  # Assuming wind speed of 0 for simplicity
+            )
+            for pv_cell in self.pv_cells
+        ]
+        average_temperature = np.mean(temperatures)
+
+        # Calculate thermal voltage (kT/q) in Volts
+        thermal_voltage = BOLTZMAN_CONSTANT * average_temperature / ELECTRON_CHARGE
+        self.bypass_diode.thermal_voltage = thermal_voltage
+
     def calculate_iv_curve(
         self,
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
+        wind_speed: float,
         *,
         current_density_series: np.ndarray | None = None,
         current_series: np.ndarray | None = None,
         voltage_series: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
         """
         Calculate the IV curve for the bypassed string of cells.
 
-        Inputs:
-            - ambient_celsius_temperature:
-                The ambient temperature, in degrees Celsius.
-            - irradiance_array:
-                The irradiance, in W/m^2, striking all the cells in the module.
-            - current_density_series:
-                If provided, the current-density series---the series of opints over which to
-                calculate the current an power output from the cell.
-            - current_series:
-                The series of current points over which to calculate the current and power
-                output from the cell.
-            - voltage_series:
-                The series of voltage points over which to calculate the current and power
-                output from the cell.
+        :param: ambient_celsius_temperature
+            The ambient temperature, in degrees Celsius.
 
-        Returns:
-            - current_series:
-                The current values.
-            - power_series:
-                The power values.
-            - voltage_series:
-                The voltage series.
+        :param: irradiance_array
+            The irradiance, in W/m^2, striking all the cells in the module.
+
+        :param: wind_speed
+            The wind speed, in m/s, over the cell.
+
+        :param: current_density_series
+            If provided, the current-density series---the series of opints over which to
+            calculate the current an power output from the cell.
+
+        :param: current_series
+            The series of current points over which to calculate the current and power
+            output from the cell.
+
+        :param: voltage_series
+            The series of voltage points over which to calculate the current and power
+            output from the cell.
+
+        :returns: current_series
+            The current values.
+
+        :returns: power_series
+            The power values.
+
+        :returns: voltage_series
+            The voltage series.
+
+        :returns: pv_cells_bypassed
+            Whether the PV cells have been bypassed.
 
         """
 
+        # Set the bypass-diode tepmerature.
+        self.set_bypass_diode_temperature(ambient_celsius_temperature, irradiance_array)
+
         # Calculate the curves for each cell
-        cell_to_iv_series: dict[PVCell, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
-        for pv_cell in tqdm(self.pv_cells, desc="Bypassed IV curves", leave=False):
-            cell_to_iv_series[pv_cell] = pv_cell.calculate_iv_curve(
+        cell_to_iv_series: dict[PVCell, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
+            pv_cell: pv_cell.calculate_iv_curve(
                 ambient_celsius_temperature,
                 irradiance_array,
+                wind_speed,
                 current_density_series=current_density_series,
                 current_series=current_series,
-                voltage_series=voltage_series,
+                # voltage_series=voltage_series,
             )
+            for pv_cell in tqdm(self.pv_cells, desc="Bypassed IV curves", leave=False)
+        }
 
         # Add up the voltage for each cell
         combined_voltage_series = sum(
@@ -153,63 +248,97 @@ class BypassedCellString:
 
         # Determine the bypass-diode curve
         bypass_diode_curve = self.bypass_diode.calculate_i_from_v(
-            combined_voltage_series
+            bypass_voltage_series := np.linspace(-1, 0, VOLTAGE_RESOLUTION)
         )
 
-        # Bypass based on the diode voltage.
-        combined_voltage_series = np.array(
-            [
-                max(entry, self.bypass_diode.bypass_voltage)
-                for entry in combined_voltage_series
-            ]
+        # Construct an interpreter
+        cell_string_interp = lambda v: np.interp(
+            v,
+            combined_voltage_series,
+            current_series,
+            period=np.max(combined_voltage_series) - np.min(combined_voltage_series),
+        )
+        total_current = [
+            cell_string_interp(voltage) + bypass_diode_curve[index]
+            for index, voltage in enumerate(bypass_voltage_series)
+        ] + list(current_series[combined_voltage_series > 0])
+        voltage_values = list(bypass_voltage_series) + list(
+            combined_voltage_series[combined_voltage_series > 0]
+        )
+
+        sorted_voltage_series, sorted_total_current = zip(
+            *sorted(zip(voltage_values, total_current))
         )
 
         # Re-compute the combined power series.
-        combined_power_series = (
-            current_series := cell_to_iv_series[self.pv_cells[0]][0]
-        ) * combined_voltage_series
+        sorted_voltage_series = np.array(sorted_voltage_series)
+        sorted_total_current = np.array(sorted_total_current)
+        sorted_total_power = sorted_voltage_series * sorted_total_current
 
-        return current_series, combined_power_series, combined_voltage_series
+        # Determine whether the cells have been bypassed
+        pv_cells_bypassed: list[bool] = list(
+            current > cell_string_interp(voltage)
+            for current, voltage in zip(bypass_diode_curve, bypass_voltage_series)
+        ) + [False] * len(combined_voltage_series[combined_voltage_series > 0])
 
+        return (
+            sorted_total_current,
+            sorted_total_power,
+            sorted_voltage_series,
+            pv_cells_bypassed,
+        )
 
-    def calculate_iv_curve_interpolation(
+    def calculate_iv_curve_for_plotting(
         self,
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
-        voltage_interp_array: np.ndarray | None = None,
-        param_grid: np.ndarray | None = None,
+        wind_speed: float,
         *,
         current_density_series: np.ndarray | None = None,
         current_series: np.ndarray | None = None,
         voltage_series: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
         """
-        Calculate the IV curve for the bypassed string of cells.
+        Calculate the IV curve for the bypassed string of cells for plotting.
 
-        Inputs:
-            - ambient_celsius_temperature:
-                The ambient temperature, in degrees Celsius.
-            - irradiance_array:
-                The irradiance, in W/m^2, striking all the cells in the module.
-            - current_density_series:
-                If provided, the current-density series---the series of opints over which to
-                calculate the current an power output from the cell.
-            - current_series:
-                The series of current points over which to calculate the current and power
-                output from the cell.
-            - voltage_series:
-                The series of voltage points over which to calculate the current and power
-                output from the cell.
+        This function differs from the normal calculation in that the bypass-diode curve
+        is computed as a function of current within a sensible range, i.e., up to 1.25
+        times the short-circuit current.
 
-        Returns:
-            - current_series:
-                The current values.
-            - power_series:
-                The power values.
-            - voltage_series:
-                The voltage series.
+        :param: ambient_celsius_temperature
+            The ambient temperature, in degrees Celsius.
+
+        :param: irradiance_array
+            The irradiance, in W/m^2, striking all the cells in the module.
+
+        :param: wind_speed
+            The wind speed, in m/s, over the cell.
+
+        :param: current_density_series
+            If provided, the current-density series---the series of opints over which to
+            calculate the current an power output from the cell.
+
+        :param: current_series
+            The series of current points over which to calculate the current and power
+            output from the cell.
+
+        :param: voltage_series
+            The series of voltage points over which to calculate the current and power
+            output from the cell.
+
+        :returns: current_series
+            The current values.
+
+        :returns: voltage_series
+            The voltage series.
+
+        :returns: bypass_diode_curve
+            The curve for the bypass diodes.
 
         """
+
+        # Set the bypass-diode tepmerature.
+        self.set_bypass_diode_temperature(ambient_celsius_temperature, irradiance_array)
 
         # Calculate the curves for each cell
         cell_to_iv_series: dict[PVCell, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
@@ -224,8 +353,7 @@ class BypassedCellString:
             cell_to_iv_series[pv_cell] = pv_cell.calculate_iv_curve_interpolation(
                 ambient_celsius_temperature,
                 irradiance_array,
-                voltage_interp_array=voltage_interp_array,
-                param_grid=param_grid,
+                wind_speed,
                 current_density_series=current_density_series,
                 current_series=current_series,
                 voltage_series=voltage_series,
@@ -238,20 +366,18 @@ class BypassedCellString:
 
         # Determine the bypass-diode curve
         bypass_diode_curve = self.bypass_diode.calculate_i_from_v(
-            combined_voltage_series
+            (
+                bypass_diode_voltage := np.linspace(
+                    self.bypass_diode.calculate_v_from_i(np.max(current_series)),
+                    np.max(combined_voltage_series),
+                    VOLTAGE_RESOLUTION,
+                )
+            )
         )
 
-        # Bypass based on the diode voltage.
-        combined_voltage_series = np.array(
-            [
-                max(entry, self.bypass_diode.bypass_voltage)
-                for entry in combined_voltage_series
-            ]
+        return (
+            current_series,
+            combined_voltage_series,
+            bypass_diode_curve,
+            bypass_diode_voltage,
         )
-
-        # Re-compute the combined power series.
-        combined_power_series = (
-            current_series := cell_to_iv_series[self.pv_cells[0]][0]
-        ) * combined_voltage_series
-
-        return current_series, combined_power_series, combined_voltage_series

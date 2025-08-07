@@ -102,15 +102,16 @@ def _radiation_to_sky_coefficient(
     Winchester, B., Nelson, J., and Markides, C.N., "HEATDesalination" [Software]
     Available from: https://github.com/BenWinchester/HEATDesalination
 
-    Inputs:
-        - collector_emissivity:
-            The emissivity of the collector.
-        - collector_temperature:
-            The temperature of the collector, measured in Kelvin.
-        - sky_temperature:
-            The sky temperature, measured in Kelvin.
+    :param: **collector_emissivity:**
+        The emissivity of the collector.
 
-    Outputs:
+    :param: **collector_temperature:**
+        The temperature of the collector, measured in Kelvin.
+
+    :param: **sky_temperature:**
+        The sky temperature, measured in Kelvin.
+
+    :returns:
         The heat-transfer coefficient between the collector and the sky, measured in
         Watts per meter squared.
 
@@ -135,8 +136,7 @@ def _sky_temperature(ambient_temperature: float) -> float:
     surrounding air, or the ambient temperature. This function converts between them and
     outputs the sky's radiative temperature.
 
-    Outputs:
-        The radiative temperature of the "sky" in Kelvin.
+    :returns: The radiative temperature of the "sky" in Kelvin.
 
     """
 
@@ -538,16 +538,17 @@ class PVCell:
         which is linear in temperature and can be solved iteratively as the value of e'
         contains higher-order terms in temperature.
 
-        Inputs:
-            - ambient_temperature:
-                The ambient temperature, measured in degrees Kelvin.
-            - solar_irradiance:
-                The solar irradiance incident on the collector, measured in Watts per
-                meter squared.
-            - wind_speed:
-                The wind speed in meters per second.
+        :param: **ambient_temperature:**
+            The ambient temperature, measured in degrees Kelvin.
 
-        Outputs:
+        :param: **solar_irradiance:**
+            The solar irradiance incident on the collector, measured in Watts per meter
+            squared.
+
+        :param: **wind_speed:**
+            The wind speed in meters per second.
+
+        :returns:
             The average temperature of the PV module installed in degrees Kelvin.
 
         """
@@ -679,36 +680,47 @@ class PVCell:
         self,
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
+        wind_speed: float,
         *,
         current_density_series: np.ndarray | None = None,
         current_series: np.ndarray | None = None,
         voltage_series: np.ndarray | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
         """
         Calculate the IV curve for the cell.
 
-        Inputs:
-            - ambient_celsius_temperature:
-                The ambient temperature, in degrees Celsius.
-            - irradiance_array:
-                The irradiance, in W/m^2, striking all the cells in the module.
-            - current_density_series:
-                If provided, the current-density series---the series of opints over which to
-                calculate the current an power output from the cell.
-            - current_series:
-                The series of current points over which to calculate the current and power
-                output from the cell.
-            - voltage_series:
-                The series of voltage points over which to calculate the current and power
-                output from the cell.
+        :param: ambient_celsius_temperature
+            The ambient temperature, in degrees Celsius.
 
-        Returns:
-            - current_series:
-                The current values.
-            - power_series:
-                The power values.
-            - voltage_series:
-                The voltage series.
+        :param: irradiance_array
+            The irradiance, in W/m^2, striking all the cells in the module.
+
+        :param: wind_speed
+            The wind speed, in m/s, over the cell.
+
+        :param: current_density_series
+            If provided, the current-density series---the series of opints over which to
+            calculate the current an power output from the cell.
+
+        :param: current_series
+            The series of current points over which to calculate the current and power
+            output from the cell.
+
+        :param: voltage_series
+            The series of voltage points over which to calculate the current and power
+            output from the cell.
+
+        :returns: current_series
+            The current values.
+
+        :returns: power_series
+            The power values.
+
+        :returns: voltage_series
+            The voltage series.
+
+        :returns: pv_cells_bypassed
+            If the cell has broken down, this is returned.
 
         """
 
@@ -716,13 +728,12 @@ class PVCell:
             self.average_cell_temperature(
                 ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
                 (solar_irradiance := irradiance_array.iloc[self.cell_id]),
-                # TODO: Implement wind speed here using renewables.ninja data.
-                0,
+                wind_speed,
             )
             - ZERO_CELSIUS_OFFSET
         )
 
-        return calculate_cell_iv_curve(
+        current_series, voltage_series, power_series = calculate_cell_iv_curve(
             cell_temperature,
             solar_irradiance,
             self,
@@ -843,6 +854,13 @@ def interpolate_voltage_curve(
         return v0 * (1 - w_irrad) + v1 * w_irrad
 
 
+        return (
+            current_series,
+            voltage_series,
+            power_series,
+            list(voltage_series >= self.breakdown_voltage),
+        )
+
 
 def calculate_cell_iv_curve(
     cell_temperature: np.ndarray | float,
@@ -863,30 +881,35 @@ def calculate_cell_iv_curve(
     NOTE: The current OR the voltage series should be supplied, not both, and this
     function will calculate whichever is not supplied.
 
-    Inputs:
-        - cell_temperature:
-            The cell temperature, in degrees Celsius.
-        - irradiance:
-            The irradiance, in W/m^2, striking the cell.
-        - pv_cell:
-            The PV cell being considered.
-        - current_density_series:
-            If provided, the current-density series---the series of opints over which to
-            calculate the current an power output from the cell.
-        - current_series:
-            The series of current points over which to calculate the current and power
-            output from the cell.
-        - voltage_series:
-            The series of voltage points over which to calculate the current and power
-            output from the cell.
+    :param: **cell_temperature:**
+        The cell temperature, in degrees Celsius.
 
-    Returns:
-        - current_series:
-            The current values.
-        - power_series:
-            The power values.
-        - voltage_series:
-            The voltage series.
+    :param: **irradiance:**
+        The irradiance, in W/m^2, striking the cell.
+
+    :param: **pv_cell:**
+        The PV cell being considered.
+
+    :param: **current_density_series:**
+        If provided, the current-density series---the series of opints over which to
+        calculate the current an power output from the cell.
+
+    :param: **current_series:**
+        The series of current points over which to calculate the current and power
+        output from the cell.
+
+    :param: **voltage_series:**
+        The series of voltage points over which to calculate the current and power
+        output from the cell.
+
+    :returns: current_series
+        The current values.
+
+    :returns: power_series:
+        The power values.
+
+    :returns: voltage_series:
+        The voltage series.
 
     """
 
@@ -1044,20 +1067,26 @@ def get_irradiance(
     """
     Compute the irradiance falling on an individual solar cell.
 
-    Inputs:
-        - pv_cell:
-            The cell to calculate these values for.
-        - diffuse_horizontal_irradiance:
-            The diffuse horizontal irradiance in W/m^2.
-        - global_horizontal_irradiance:
-            The global horizontal irradiance.
-        - solar_azimuth:
-            The current azimuth angle of the sun.
-        - solar_zenith:
-            The current zenith angle of the sun, _i.e._, it's declanation.
-        - direct_normal_irradiance:
-            If provided, the direct normal irradiance in W/m^2. If not, this is
-            calculated using the solar zenith angle.
+    :param: **pv_cell:
+        The cell to calculate these values for.
+
+    :param: **diffuse_horizontal_irradiance:
+        The diffuse horizontal irradiance in W/m^2.
+
+    :param: **global_horizontal_irradiance:
+        The global horizontal irradiance.
+
+    :param: **solar_azimuth:
+        The current azimuth angle of the sun.
+
+    :param: **solar_zenith:
+        The current zenith angle of the sun, _i.e._, it's declanation.
+
+    :param: **direct_normal_irradiance:
+        If provided, the direct normal irradiance in W/m^2. If not, this is calculated
+        using the solar zenith angle.
+
+    :returns: The irradiance striking the cell.
 
     """
 
@@ -1089,15 +1118,14 @@ def get_irradiance(
 
 
 def relabel_cell_electrical_parameters(
-    cell_electrical_params: dict[str, float]
+    cell_electrical_params: dict[str, float],
 ) -> dict[str, float]:
     """
     Re-map entries within the mapping to more-sensible and user-readable variable names.
 
-    Inputs:
-        The electrical parameters governing a pv cell.
+    :param: The electrical parameters governing a pv cell.
 
-    Returns:
+    :returns:
         The electrical parameters governing a pv cell, with variable names processed.
 
     """

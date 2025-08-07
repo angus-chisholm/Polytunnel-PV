@@ -16,14 +16,15 @@ entrypoint for executing the model.
 
 """
 
-__version__ = "1.0.0a1"
+__version__ = "1.0.0a2"
 
 
 # Use AGG when running on HPC - uncomment below if running on HPC
 # matplotlib.use('Agg')
 import argparse
-import datetime
+import enum
 import functools
+import json
 import math
 import matplotlib.colors as mcolors
 import matplotlib.patches as mpatches
@@ -31,6 +32,8 @@ import multiprocessing
 import os
 import pvlib
 import re
+import scipy
+import scipy.optimize
 import seaborn as sns
 import sys
 import time
@@ -40,11 +43,12 @@ import pdb
 
 from datetime import datetime, timedelta
 from collections import defaultdict
+from collections.abc import Iterator
 from joblib import Parallel, delayed
 from matplotlib import pyplot as plt
 from matplotlib import rc, rcParams
 from multiprocessing.dummy import Pool as ThreadPool
-from typing import Any, Hashable, Match, Pattern
+from typing import Any, Callable, Generator, Hashable, Match, Pattern
 
 import numpy as np
 import pandas as pd
@@ -52,13 +56,13 @@ import pandas as pd
 from tqdm import tqdm
 from tqdm.std import tqdm as tqdm_pbar
 
-from .__utils__ import NAME
+from .__utils__ import NAME, VOLTAGE_RESOLUTION
 from .pv_module.bypass_diode import BypassDiode, BypassedCellString
 from .pv_module.pv_cell import (
     get_irradiance,
     PVCell,
     relabel_cell_electrical_parameters,
-    calculate_cell_iv_curve,
+    ZERO_CELSIUS_OFFSET,
 )
 from .pv_module.pv_module import (
     Curve,
@@ -77,6 +81,10 @@ rcParams["ps.fonttype"] = 42
 sns.set_context("notebook")
 sns.set_style("ticks")
 
+import warnings
+
+warnings.filterwarnings("ignore")
+
 # BYPASS_DIODES:
 #   Keyword for the bypass-diode parameters.
 BYPASS_DIODES: str = "bypass_diodes"
@@ -89,6 +97,10 @@ CELL_ELECTRICAL_PARAMETERS: str = "cell_electrical_parameters"
 #   Keyword for the name of the cell-type to use.
 CELL_TYPE: str = "cell_type"
 
+# CURRENT_SAMPLING_RATE:
+#    Rate used to sample current data for ease of calculation.
+CURRENT_SAMPLING_RATE: int = 20
+
 # DONE:
 #   The message to display when a task was successful.
 DONE: str = "[   DONE   ]"
@@ -100,6 +112,14 @@ FAILED: str = "[  FAILED  ]"
 # FILE_ENCODING:
 #   The encoding to use when opening and closing files.
 FILE_ENCODING: str = "UTF-8"
+
+# HOUR:
+#   Column header to use when saving hour information.
+HOUR: str = "Hour"
+
+# INDEX:
+#   Used to distinguish plot versions.
+INDEX: int = 1
 
 # INPUT_DATA_DIRECTORY:
 #   The name of the input-data directory.
@@ -140,6 +160,10 @@ MODULE_STRINGS: str = "module_strings"
 # N_MODULES:
 #   The number of modules in the string.
 N_MODULES: str = "n_modules"
+
+# OUTPUT_DIRECTORY:
+#   The name of the outputs directory to use.
+OUTPUT_DIRECTORY: str = "outputs"
 
 # POLYTUNNEL_CURVE@
 #   Keyword used for parsing the information about the curve on which a solar panel
@@ -199,6 +223,10 @@ POLYTUNNEL_HEADER_STRING: str = """
 #   The name of the polytunnels file.
 POLYTUNNELS_FILENAME: str = "polytunnels.yaml"
 
+# PRE_LOADED_PV_CELLS:
+#   Mapping for storing cell data when loaded.
+PRE_LOADED_PV_CELLS: dict[str, Any] = {}
+
 # PV_CELL:
 #   Keyword for parsing cell-id information.
 PV_CELL: str = "cell_id"
@@ -217,11 +245,11 @@ PVLIB_DATABASE_NAME: str = "CECmod"
 
 # PV_MODULES_FILENAME:
 #   The name of the PV-modules file.
-PV_MODULES_FILENAME: str = "pv_modules.yaml"
+PV_MODULES_FILENAME: str = "pv_modules.json"
 
 # SCENARIOS_FILENAME:
 #   The name of the scenarios file.
-SCENARIOS_FILENAME: str = "scenarios.yaml"
+SCENARIOS_FILENAME: str = "scenarios.json"
 
 # SKIPPED:
 #   The message to display when a task was successful.
@@ -239,6 +267,10 @@ SOLAR_ZENITH: str = "apparent_zenith"
 #   Column header for temperature column.
 TEMPERATURE: str = "temperature"
 
+# TIME:
+#   Column header for time.
+TIME: str = "time"
+
 # TYPE:
 #   Keyword used to determine the module type of the PV.
 TYPE: str = "type"
@@ -247,10 +279,6 @@ TYPE: str = "type"
 #   Regex used to extract the main version number.
 VERSION_REGEX: Pattern[str] = re.compile(r"(?P<number>\d\.\d\.\d)([\.](?P<post>.*))?")
 
-# VOLTAGE_RESOLUTION:
-#   The number of points to use for IV plotting.
-VOLTAGE_RESOLUTION: int = 1000
-
 # WEATHER_DATA_DIRECTORY:
 #   The directory where weather data should be found.
 WEATHER_DATA_DIRECTORY: str = "weather_data"
@@ -258,6 +286,14 @@ WEATHER_DATA_DIRECTORY: str = "weather_data"
 # WEATHER_DATA_REGEX:
 #   Regex used for parsing location names from weather data.
 WEATHER_DATA_REGEX: Pattern[str] = re.compile(r"ninja_pv_(?P<location_name>.*)\.csv")
+
+# WIND_DATA_REGEX:
+#   Regex used for parsing location names from weather data.
+WIND_DATA_REGEX: Pattern[str] = re.compile(r"ninja_wind_(?P<location_name>.*)\.csv")
+
+# WIND_SPEED:
+#   Column header for wind-speed column.
+WIND_SPEED: str = "wind_speed"
 
 # WEATHER_FILE_WITH_SOLAR:
 #   The name of the weather file with the solar data.
@@ -275,13 +311,107 @@ class ArgumentError(Exception):
         super().__init__(f"Incorrect CLI arguments: {msg}")
 
 
+class Dashes(Iterator):
+    """
+    Contains the dash information for plotting.
+
+    .. attribute:: dashes
+        The dashes to include.
+
+    """
+
+    def __init__(self) -> None:
+        """
+        Instantiate the dashes.
+
+        """
+
+        self.dash_length: int = 0
+        self.space: int = 1
+        super().__init__()
+
+    def __next__(self) -> Generator[tuple[int, int], None, None]:
+        """
+        Iterate through and yield the dash information.
+
+        :yields: The dash information as a `tuple`.
+
+        """
+
+        # Move on the dash length
+        self.dash_length += 1
+
+        # Move on the space length if needed
+        if self.dash_length - self.space > 3:
+            self.dash_length = 1
+            self.space += 1
+
+        return (self.dash_length, self.space)
+
+
+class OperatingMode(enum.Enum):
+    """
+    Used to determine what operation to carry out.
+
+    - HOURLY_MPP:
+        Carry out a computation for the hourly MPP across the module.
+
+    - HOURLY_MPP_HPC:
+        Carry out a computation for the hourly MPP across the module when operating on a
+        high-performance computer (HPC), *i.e.*, in parallel operation.
+
+    - IRRADIANCE_HEATMAPS:
+        Generate irradiance and temperature heatmaps.
+
+    - IRRADIANCE_LINEPLOTS:
+        Generate irradiance and temperature lineplots.
+
+    - IV_CURVES:
+        Generate IV curves for the module.
+
+    - VALIDATION:
+        Validate the model against inputted data.
+
+    """
+
+    HOURLY_MPP: str = "hourly_mpp"
+    HOURLY_MPP_HPC: str = "hourly_mpp_hpc"
+    HOURLY_MPP_MACHINE_LEARNING_TRAING: str = "hourly_mpp_machine_learning"
+    IRRADIANCE_HEATMAPS: str = "irradiance_heatmaps"
+    IRRADIANCE_LINEPLOTS: str = "irradiance_lineplots"
+    IV_CURVES: str = "iv_curves"
+    VALIDATION: str = "validation"
+
+
+def _find_zero_crossing(numbers: list[float | int]) -> tuple[int, float | int] | None:
+    """
+    Finds the first point where the list of numbers crosses zero from +ve to -ve.
+
+    :param: numbers
+        A list of numbers, floats or integers..
+
+    :returns:
+        - The index and number of the crossing point.
+        - `None` if there is no solution.
+
+    """
+
+    # Loop through the numbers.
+    for index in range(1, len(numbers)):
+
+        # Return the index and value of the number which crosses.
+        if numbers[index - 1] > 0 and numbers[index] <= 0:
+            return index, numbers[index]
+
+    return None
+
+
 def _parse_args(unparsed_args: list[str]) -> argparse.Namespace:
     """
     Parse the command-line arguments.
 
-    Inputs:
-        - unparsed_args:
-            The unparsed command-line arguments.
+    :param: **unparsed_args:**
+        The unparsed command-line arguments.
 
     """
 
@@ -321,6 +451,14 @@ def _parse_args(unparsed_args: list[str]) -> argparse.Namespace:
         type=str,
         help="The name of the timestamps file to use for simualtions.",
         default=None,
+    )
+
+    # Operating mode:
+    #   The operation to carry out.
+    parser.add_argument(
+        "--operating-mode",
+        choices=[entry.value for entry in OperatingMode],
+        help="Specify the operating mode.",
     )
 
     # Weather-data arguments.
@@ -401,13 +539,13 @@ def _parse_pv_modules(
     """
     Parse the curved PV module information from the files.
 
-    Inputs:
-        - polytunnels:
-            A mapping between polytunnel names and instances.
-        - user_defined_pv_cells:
+    :param: **polytunnels:**
+        A mapping between polytunnel names and instances.
+
+    :param: **user_defined_pv_cells:**
             A mapping between PV cell name and pv cell information.
 
-    Outputs:
+    :returns:
         The parsed PV modules as a list.
 
     """
@@ -417,7 +555,7 @@ def _parse_pv_modules(
         "r",
         encoding=FILE_ENCODING,
     ) as f:
-        pv_module_data = yaml.safe_load(f)
+        pv_module_data = json.load(f)
 
     def _construct_pv_module(pv_module_entry) -> CurvedPVModule:
         """
@@ -451,20 +589,75 @@ def _parse_pv_modules(
 
         # Try first to find the cell definition in a user-defined scope.
         try:
-            cell_electrical_parameters = user_defined_pv_cells[cell_type_name]
+            cell_electrical_parameters = PRE_LOADED_PV_CELLS[cell_type_name]
         except KeyError:
-            # Look within the pvlib database for the cell name.
             try:
-                cell_electrical_parameters = (
-                    pvlib.pvsystem.retrieve_sam(PVLIB_DATABASE_NAME)
-                    .loc[:, cell_type_name]
-                    .to_dict()
-                )
+                cell_electrical_parameters = user_defined_pv_cells[cell_type_name]
             except KeyError:
-                raise Exception(
-                    f"Could not find cell name {cell_type_name} within either local or "
-                    "pvlib-imported scope."
-                ) from None
+                # Look within the pvlib database for the cell name.
+                try:
+                    cell_electrical_parameters = (
+                        pvlib.pvsystem.retrieve_sam(PVLIB_DATABASE_NAME)
+                        .loc[:, cell_type_name]
+                        .to_dict()
+                    )
+                    PRE_LOADED_PV_CELLS[cell_type_name] = cell_electrical_parameters
+
+                    # match name:
+                    #     case "CdTe":
+                    #         PRE_LOADED_PV_CELLS[cell_type_name]["EgRef"] = 1.475
+
+                    #  Crystalline Silicon (Si):
+                    #      * EgRef = 1.121
+                    #      * dEgdT = -0.0002677
+
+                    #      >>> M = np.polyval([-1.26E-4, 2.816E-3, -0.024459, 0.086257, 0.9181],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [1]
+
+                    #  Cadmium Telluride (CdTe):
+                    #      * dEgdT = -0.0003
+
+                    #      >>> M = np.polyval([-2.46E-5, 9.607E-4, -0.0134, 0.0716, 0.9196],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [4]
+
+                    #  Copper Indium diSelenide (CIS):
+                    #      * EgRef = 1.010
+                    #      * dEgdT = -0.00011
+
+                    #      >>> M = np.polyval([-3.74E-5, 0.00125, -0.01462, 0.0718, 0.9210],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: [4]
+
+                    #  Copper Indium Gallium diSelenide (CIGS):
+                    #      * EgRef = 1.15
+                    #      * dEgdT = ????
+
+                    #      >>> M = np.polyval([-9.07E-5, 0.0022, -0.0202, 0.0652, 0.9417],
+                    #      ...                AMa) # doctest: +SKIP
+
+                    #      Source: Wikipedia
+
+                    #  Gallium Arsenide (GaAs):
+                    #      * EgRef = 1.424
+                    #      * dEgdT = -0.000433
+                    #      * M = unknown
+
+                    #             except KeyError:
+                    #                 raise Exception(
+                    #                     f"Could not find cell name {cell_type_name} within either local or "
+                    #                     "pvlib-imported scope."
+                    #                 ) from None
+
+                except KeyError:
+                    raise Exception(
+                        f"Could not find cell name {cell_type_name} within either local or "
+                        "pvlib-imported scope."
+                    ) from None
 
         # Create bypass diodes based on the information provided.
         try:
@@ -485,7 +678,12 @@ def _parse_pv_modules(
 
         return constructor(**pv_module_entry)
 
-    return [_construct_pv_module(pv_module_entry) for pv_module_entry in pv_module_data]
+    return [
+        _construct_pv_module(pv_module_entry)
+        for pv_module_entry in tqdm(
+            pv_module_data, desc="Parsing PV modules", leave=True
+        )
+    ]
 
 
 def _parse_pv_system() -> PVSystem:
@@ -518,14 +716,14 @@ def _parse_scenarios(
     """
     Parse the scenario information.
 
-    Inputs:
-        - locations:
-            The `list` of locations to use.
-        - pv_modules:
+    :param: **locations:**
+        The `list` of locations to use.
+
+    :praam: **pv_modules:**
             The `list` of PVModules that can be installed at each location.
 
-    Outputs:
-        - scenarios:
+    :returns:
+        - **scenarios:**
             The `list` of scenarios to run.
 
     """
@@ -535,7 +733,7 @@ def _parse_scenarios(
         "r",
         encoding=FILE_ENCODING,
     ) as f:
-        scenarios_data = yaml.safe_load(f)
+        scenarios_data = json.load(f)
 
     return [
         Scenario.from_scenarios_file(entry, locations, pv_modules)
@@ -543,12 +741,23 @@ def _parse_scenarios(
     ]
 
 
-def _parse_solar() -> dict[str, pd.DataFrame]:
-    """Parse the downloaded solar data that's in the weather data directory."""
+def _parse_weather() -> dict[str, pd.DataFrame]:
+    """
+    Parse the downloaded solar data that's in the weather data directory.
+
+    :returns: A `dict` mapping the location name, as a `str`, to a
+        :class:`pandas.DataFrame` instance containing the solar and wind data.
+
+    """
 
     location_name_to_data_map: dict[str, pd.DataFrame] = {}
 
-    for filename in os.listdir(WEATHER_DATA_DIRECTORY):
+    # Parse the solar data
+    for filename in tqdm(
+        os.listdir(WEATHER_DATA_DIRECTORY),
+        desc="Parsing weather data files",
+        leave=False,
+    ):
         # Skip the file if it's not in the expected format.
         try:
             location_name = WEATHER_DATA_REGEX.match(filename).group("location_name")  # type: ignore [union-attr]
@@ -560,7 +769,38 @@ def _parse_solar() -> dict[str, pd.DataFrame]:
         ) as f:
             location_name_to_data_map[location_name] = pd.read_csv(f, comment="#")
 
+    for filename in tqdm(
+        os.listdir(WEATHER_DATA_DIRECTORY), desc="Parsing wind data files", leave=False
+    ):
+        # Skip the file if it's not in the expected format.
+        try:
+            location_name = WIND_DATA_REGEX.match(filename).group("location_name")  # type: ignore [union-attr]
+        except AttributeError:
+            continue
+
+        with open(
+            os.path.join(WEATHER_DATA_DIRECTORY, filename), "r", encoding=FILE_ENCODING
+        ) as f:
+            wind_data = pd.read_csv(f, comment="#")
+
+        location_name_to_data_map[location_name][WIND_SPEED] = wind_data[WIND_SPEED]
+
     return location_name_to_data_map
+
+
+def _sanitise_time(hours: int, formatter: str, initial_time: datetime) -> str:
+    """
+    Sanitise the time.
+
+    :param: hours
+        The hours to include.
+
+    :param: formatter
+        The string formatter to use.
+
+    """
+
+    return (initial_time + timedelta(hours=hours)).strftime(formatter)
 
 
 def _solar_angles_from_weather_row(
@@ -569,17 +809,16 @@ def _solar_angles_from_weather_row(
     """
     Use a row from the weather data to comopute the solar angles.
 
-    Inputs:
-        - row:
-            The row in the weather-data frame.
+    :param: **row:**
+        The row in the weather-data frame.
 
-    Outputs:
+    :returns:
         The solar angle-frame at this time.
 
     """
 
     return location.get_solarposition(  # type: ignore [no-any-return]
-        row[1][LOCAL_TIME], temperature=row[1][TEMPERATURE]
+        row[1][TIME], temperature=row[1][TEMPERATURE]
     )
 
 
@@ -606,8 +845,9 @@ def process_single_mpp_calculation(
         date_str = date.strftime("%d_%b_%Y")
 
         # Create a mapping between cell and power output
-        cell_to_power_map = {}
-        cell_to_voltage_map = {}
+        cell_to_power_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+        cell_to_voltage_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+        cell_to_bypass_map: dict[BypassedCellString | PVCell, list[bool]] = {}
 
         current_series = np.linspace(
             0,
@@ -627,18 +867,27 @@ def process_single_mpp_calculation(
             desc="IV calculation",
             leave=False,
         ):
-            current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
-                locations_to_weather_and_solar_map[scenario.location][time_of_day][
-                    TEMPERATURE
-                ],
+            (
+                current_series,
+                power_series,
+                voltage_series,
+                pv_cells_bypassed,
+            ) = pv_cell.calculate_iv_curve(
+                (
+                    weather_map := locations_to_weather_and_solar_map[
+                        scenario.location
+                    ][time_of_day]
+                )[TEMPERATURE],
                 1000
                 * irradiance_frame.set_index("hour")
                 .iloc[time_of_day][1:]
                 .reset_index(drop=True),
+                weather_map[WIND_SPEED],
                 current_series=current_series,
             )
             cell_to_power_map[pv_cell] = power_series
             cell_to_voltage_map[pv_cell] = voltage_series
+            cell_to_bypass_map[pv_cell] = pv_cells_bypassed
             individual_power_extreme = max(
                 individual_power_extreme, max(abs(power_series))
             )
@@ -671,9 +920,12 @@ def process_single_mpp_calculation_without_pbar(
     ],
     pv_system: PVSystem,
     scenario: Scenario,
-    voltage_interp_array: np.ndarray | None,
-    param_grid: np.ndarray| None,
-) -> tuple[int, float, str]:
+) -> tuple[
+    int,
+    float,
+    dict[BypassedCellString | PVCell, bool],
+    dict[BypassedCellString | PVCell, float],
+]:
     """
     Process the MPP calculation for a single hour of the simulation.
 
@@ -699,28 +951,47 @@ def process_single_mpp_calculation_without_pbar(
     :param: param_grid
         The array of irradiance and temperature values used to calculate the voltage curves
 
-    :return:
-        - A `tuple` containing:
-            - The hour of the day,
-            - The MPP power achieved,
-            - The date-time information.
+    :returns: The hour of the day,
 
-    """    
+    :returns: The MPP power achieved,
+
+    :returns: Which bypassed cell strings were bypassing,
+
+    :returns: and the MPP power achieved by each cell/string.
+
+    """
+
+    def _print_success() -> None:
+        """Print a message when a computation was successful."""
+
+        print(f"Hour {time_of_day} processed successfully.")
+
     try:
         hour = time_of_day % 24
-        date = datetime(2023, 1, 1) + timedelta(hours=time_of_day)
-        date_str = date.strftime("%d_%b_%Y")
-        
         max_irradiance = np.max(
             irradiance_frame.set_index("hour").iloc[time_of_day][1:]
         )
 
         if max_irradiance == 0:
-            return hour, 0, date_str
+            _print_success()
+            return (
+                hour,
+                0,
+                {
+                    cell_or_string: 0
+                    for cell_or_string in scenario.pv_module.pv_cells_and_cell_strings
+                },
+                {
+                    cell_or_string: 0
+                    for cell_or_string in scenario.pv_module.pv_cells_and_cell_strings
+                },
+            )
 
         # Create a mapping between cell and power output
-        cell_to_power_map = {}
-        cell_to_voltage_map = {}
+        cell_to_current_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+        cell_to_power_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+        cell_to_voltage_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+        cell_to_bypass_map: dict[BypassedCellString | PVCell, list[bool]] = {}
 
         current_series = np.linspace(
             0,
@@ -740,55 +1011,128 @@ def process_single_mpp_calculation_without_pbar(
             desc="IV calculation",
             leave=False,
         ):
-            # current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
-            #     locations_to_weather_and_solar_map[scenario.location][time_of_day][
-            #         TEMPERATURE
-            #     ],
-            #     1000
-            #     * irradiance_frame.set_index("hour")
-            #     .iloc[time_of_day][1:]
-            #     .reset_index(drop=True),
-            #     current_series=current_series,
-            # )
-            current_series, power_series, voltage_series = pv_cell.calculate_iv_curve_interpolation(
-                locations_to_weather_and_solar_map[scenario.location][time_of_day][
-                    TEMPERATURE
-                ],
+            (
+                current_series,
+                power_series,
+                voltage_series,
+                pv_cells_bypassed,
+            ) = pv_cell.calculate_iv_curve(
+                (
+                    weather_map := locations_to_weather_and_solar_map[
+                        scenario.location
+                    ][time_of_day]
+                )[TEMPERATURE],
                 1000
                 * irradiance_frame.set_index("hour")
-                .iloc[time_of_day][1:]
+                .iloc[time_of_day]
                 .reset_index(drop=True),
+                weather_map[WIND_SPEED],
                 current_series=current_series,
                 voltage_interp_array=voltage_interp_array,
                 param_grid=param_grid,
             )
+            cell_to_current_map[pv_cell] = current_series
             cell_to_power_map[pv_cell] = power_series
             cell_to_voltage_map[pv_cell] = voltage_series
+            cell_to_bypass_map[pv_cell] = pv_cells_bypassed
             individual_power_extreme = max(
                 individual_power_extreme, max(abs(power_series))
             )
-        
-        combined_power_series = sum(cell_to_power_map.values())
-        combined_voltage_series = sum(cell_to_voltage_map.values())
-        combined_power_series = pv_system.combine_powers(combined_power_series)
-        combined_voltage_series = pv_system.combine_voltages(combined_voltage_series)
-        combined_current_series = pv_system.combine_currents(current_series)
-        
-        
-        maximum_power_index = np.argmax(combined_power_series)
-        mpp_power = combined_power_series[maximum_power_index]
-        # Ensure unrealistic values are not included in output
-        threshold_power = 1e5 # Wp in one hour
-        while mpp_power>threshold_power:
-            combined_power_series[maximum_power_index] = 0
-            maximum_power_index = np.argmax(combined_power_series)
-            mpp_power = combined_power_series[maximum_power_index]
-        
-        mpp_current = combined_current_series[maximum_power_index]
-        
-        print(f"Hour {time_of_day} processed successfully.")
 
-        return hour, mpp_power, date_str
+        # Compute the total power produced
+        cell_voltage_interpreters = {
+            pv_cell: lambda i, pv_cell=pv_cell: np.interp(
+                i,
+                list(reversed(cell_to_current_map[pv_cell])),
+                list(reversed(cell_to_voltage_map[pv_cell])),
+                period=np.max(cell_to_current_map[pv_cell])
+                - np.min(cell_to_current_map[pv_cell]),
+            )
+            for pv_cell in scenario.pv_module.pv_cells_and_cell_strings
+        }
+
+        sampling_current_series = np.array(
+            [
+                entry
+                for entry in sorted(current_series[::CURRENT_SAMPLING_RATE])
+                if entry <= 10
+            ]
+        )
+
+        cellwise_voltage = {
+            pv_cell: [
+                interpreter(current)
+                for current in tqdm(
+                    sampling_current_series,
+                    desc="Interpolation calculation",
+                    leave=False,
+                )
+            ]
+            for pv_cell, interpreter in tqdm(
+                cell_voltage_interpreters.items(),
+                desc="Cell-wise calculation",
+                leave=False,
+            )
+        }
+        module_voltage = [sum(sublist) for sublist in zip(*cellwise_voltage.values())]
+
+        module_power = module_voltage * sampling_current_series
+
+        # Sanitise the data to avoid erroneous results at high values where the series
+        # become truncated.
+        cut_off_index, _ = _find_zero_crossing(module_power)
+        module_power = module_power[:cut_off_index]
+        module_voltage = module_voltage[:cut_off_index]
+        sampling_current_series = sampling_current_series[:cut_off_index]
+
+        mpp_index: int = list(module_power).index(np.max(module_power))
+
+        # Determine the power through the module at MPP
+        mpp_power: float = module_power[mpp_index]
+
+        # Determine the MPP power produced by each cell
+        cellwise_mpp: dict[PVCell, float] = {
+            pv_cell: voltage_interpreter(
+                (mpp_current := sampling_current_series[mpp_index])
+            )
+            * mpp_current
+            for pv_cell, voltage_interpreter in cell_voltage_interpreters.items()
+        }
+
+        def _find_nearest_index(input_list: list, target_value: float):
+            """
+            Determine the index of the nearest element to the target entry.
+
+            :param: input_list
+                The list which the entry should be looked up in.
+
+            :param: target_value
+                The value which to lookup.
+
+            :returns: The index of the closest element.
+
+            """
+
+            return min(
+                range(len(input_list)),
+                key=lambda index: abs(input_list[index] - target_value),
+            )
+
+        # Determine which cell strings were bypassing
+        bypassing_cell_strings: dict[PVCell, bool] = {
+            pv_cell: bypass_map[
+                _find_nearest_index(
+                    cell_to_voltage_map[pv_cell],
+                    cell_voltage_interpreters[pv_cell](mpp_current),
+                )
+            ]
+            for pv_cell, bypass_map in cell_to_bypass_map.items()
+        }
+
+        _print_success()
+
+        return hour, mpp_power, bypassing_cell_strings, cellwise_mpp
+
     except Exception as e:
         print(f"Error processing time_of_day {time_of_day}: {str(e)}")
         raise
@@ -800,7 +1144,7 @@ def plot_irradiance_with_marginal_means(
     start_index: int = 0,
     *,
     figname: str = "output_figure",
-    fig_format: str = "eps",
+    fig_format: str = "pdf",
     heatmap_vmax: float | None = None,
     initial_date: datetime = datetime(2015, 1, 1),
     irradiance_bar_vmax: float | None = None,
@@ -811,122 +1155,319 @@ def plot_irradiance_with_marginal_means(
     """
     Plot the irradiance heatmap with marginal means.
 
-    Inputs:
-        - data_to_plot:
-            The data to plot.
-        - start_index:
-            The index to start plotting from.
-        - figname:
-            The name to use when saving the figure.
-        - fig_format:
-            The file extension format to use when saving the high-resolution output
-            figures.
-        - heatmap_vmax:
-            The maximum plotting value to use for the irradiance heatmap.
-        - irradiance_bar_vmax:
-            The maximum plotting value to use for the irradiance bars.
-        - irradiance_scatter_vmax:
-            The maximum plotting value to use for the irradiance scatter.
-        - irradiance_scatter_vmin:
-            The minimum plotting value to use for the irradiance scatter.
+    :param: **data_to_plot:**
+        The data to plot.
+
+    :param: **start_index:**
+        The index to start plotting from.
+
+    :param: **figname:**
+        The name to use when saving the figure.
+
+    :param: **fig_format:**
+        The file extension format to use when saving the high-resolution output figures.
+
+    :param: **heatmap_vmax:**
+        The maximum plotting value to use for the irradiance heatmap.
+
+    :param: **irradiance_bar_vmax:**
+        The maximum plotting value to use for the irradiance bars.
+
+    :param: **irradiance_scatter_vmax:**
+        The maximum plotting value to use for the irradiance scatter.
+
+    :param: **irradiance_scatter_vmin:**
+        The minimum plotting value to use for the irradiance scatter.
 
     """
 
     sns.set_style("ticks")
-    frame_slice = data_to_plot.iloc[start_index : start_index + 24].set_index("hour")
-
-    # Create a dummy plot and surrounding axes.
-    joint_plot_grid = sns.jointplot(
-        data=frame_slice,
-        kind="hist",
-        bins=(len(frame_slice.columns), 24),
-        marginal_ticks=True,
-    )
-    joint_plot_grid.ax_marg_y.cla()
-    joint_plot_grid.ax_marg_x.cla()
-
-    # Generate the central heatmap.
-    sns.heatmap(
-        frame_slice,
-        ax=joint_plot_grid.ax_joint,
-        cmap=sns.blend_palette(
-            ["#144E56", "teal", "#94B49F", "orange", "#E04606"], as_cmap=True
-        ),
-        vmin=0,
-        vmax=heatmap_vmax,
-        cbar=True,
-        cbar_kws={"label": "Irradiance / kWm$^{-2}$"},
+    frame_slice = (
+        data_to_plot.fillna(0).iloc[start_index : start_index + 24].set_index("hour")
     )
 
-    # Plot the irradiance bars on the RHS of the plot.
-    joint_plot_grid.ax_marg_y.barh(
-        np.arange(0.5, 24.5), frame_slice.mean(axis=1).to_numpy(), color="#E04606"
+    with tqdm(desc="Plotting", leave=False, total=3, unit="steps") as pbar:
+        # Create a dummy plot and surrounding axes.
+        joint_plot_grid = sns.jointplot(
+            data=frame_slice,
+            kind="hist",
+            bins=(len(frame_slice.columns), 24),
+            marginal_ticks=True,
+            ratio=4,
+        )
+        joint_plot_grid.ax_marg_y.cla()
+        joint_plot_grid.ax_marg_x.cla()
+        pbar.update(1)
+
+        # Generate the central heatmap.
+        sns.heatmap(
+            frame_slice,
+            ax=joint_plot_grid.ax_joint,
+            cmap=sns.blend_palette(
+                ["#144E56", "teal", "#94B49F", "orange", "#E04606"], as_cmap=True
+            ),
+            vmin=0,
+            vmax=heatmap_vmax,
+            cbar=True,
+            cbar_kws={"label": "Irradiance / kWm$^{-2}$"},
+        )
+        pbar.update(1)
+
+        # Plot the irradiance bars on the RHS of the plot.
+        joint_plot_grid.ax_marg_y.barh(
+            np.arange(0.5, 24.5), frame_slice.mean(axis=1).to_numpy(), color="#E04606"
+        )
+        joint_plot_grid.ax_marg_y.set_xlim(0, math.ceil(10 * irradiance_bar_vmax) / 10)
+
+        # Plot the scatter at the top of the plot.
+        joint_plot_grid.ax_marg_x.scatter(
+            np.arange(0.5, len(frame_slice.columns) + 0.5),
+            (cellwise_means := frame_slice.mean(axis=0).to_numpy()),
+            color="#144E56",
+            marker="D",
+            s=60,
+            alpha=0.7,
+        )
+        joint_plot_grid.ax_marg_x.set_ylim(
+            irradiance_scatter_vmin, irradiance_scatter_vmax
+        )
+
+        joint_plot_grid.ax_joint.set_xlabel("Mean angle from polytunnel axis")
+        joint_plot_grid.ax_joint.set_ylabel("Hour of the day")
+        joint_plot_grid.ax_joint.set_title(
+            (initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y"),
+            fontweight="bold",
+        )
+        joint_plot_grid.ax_joint.legend().remove()
+
+        # Remove ticks from axes
+        joint_plot_grid.ax_marg_x.tick_params(axis="x", bottom=False, labelbottom=False)
+        joint_plot_grid.ax_marg_x.set_xlabel("Average irradiance / kWm$^{-2}$")
+        joint_plot_grid.ax_marg_y.tick_params(axis="y", left=False, labelleft=False)
+        # joint_plot_grid.ax_marg_y.set_xlabel("Average irradiance / kWm$^{-2}$")
+        # remove ticks showing the heights of the histograms
+        # joint_plot_grid.ax_marg_x.tick_params(axis='y', left=False, labelleft=False)
+        # joint_plot_grid.ax_marg_y.tick_params(axis='frame_slice', bottom=False, labelbottom=False)
+
+        joint_plot_grid.ax_marg_x.grid("on")
+        # joint_plot_grid.ax_marg_x.set_ylabel("Average irradiance")  #
+
+        joint_plot_grid.figure.tight_layout()
+
+        # Adjust the plot such that the colourbar appears to the RHS.
+        # Solution from JohanC (https://stackoverflow.com/users/12046409/johanc)
+        # Obtained with permission from stackoverflow:
+        # https://stackoverflow.com/questions/60845764/how-to-add-a-colorbar-to-the-side-of-a-kde-jointplot
+        #
+        plt.subplots_adjust(left=0.1, right=0.8, top=0.9, bottom=0.1)
+        pos_joint_ax = joint_plot_grid.ax_joint.get_position()
+        pos_marg_x_ax = joint_plot_grid.ax_marg_x.get_position()
+        joint_plot_grid.ax_joint.set_position(
+            [pos_joint_ax.x0, pos_joint_ax.y0, pos_marg_x_ax.width, pos_joint_ax.height]
+        )
+        joint_plot_grid.figure.axes[-1].set_position(
+            [0.83, pos_joint_ax.y0, 0.07, pos_joint_ax.height]
+        )
+
+        # Save the figure in high- and low-resolution formats.
+        plt.savefig(
+            f"{figname}.{fig_format}",
+            format=fig_format,
+            bbox_inches="tight",
+            pad_inches=0,
+        )
+
+        if show_figure:
+            plt.show()
+
+        pbar.update(1)
+
+
+def plot_temperature_with_marginal_means(
+    data_to_plot: pd.DataFrame,
+    start_index: int = 0,
+    *,
+    figname: str = "output_figure",
+    fig_format: str = "pdf",
+    heatmap_vmax: float | None = None,
+    initial_date: datetime = datetime(2015, 1, 1),
+    locations_to_weather_and_solar_map: dict[
+        pvlib.location.Location, list[dict[str, Any]]
+    ],
+    scenario: Scenario,
+    show_figure: bool = True,
+    temperature_bar_vmax: float | None = None,
+    temperature_scatter_vmax: float | None = None,
+    temperature_scatter_vmin: float | None = 0,
+) -> None:
+    """
+    Plot the temperature heatmap with marginal means.
+
+    :param: **data_to_plot:**
+        The data to plot.
+
+    :param: **start_index:**
+        The index to start plotting from.
+
+    :param: **figname:**
+        The name to use when saving the figure.
+
+    :param: **fig_format:**
+        The file extension format to use when saving the high-resolution output figures.
+
+    :param: **heatmap_vmax:**
+        The maximum plotting value to use for the irradiance heatmap.
+
+    :param: **initial_date:**
+        The initial date for the run.
+
+    :param: **locations_to_weather_and_solar_map:**
+        A map between the location name and the weather and solar data.
+
+    :param: **scenario:**
+        The :class:`Scenario` governing the run.
+
+    :param: **temperature_bar_vmax:**
+        The maximum plotting value to use for the irradiance bars.
+
+    :param: **temperature_scatter_vmax:**
+        The maximum plotting value to use for the irradiance scatter.
+
+    :param: **temperature_scatter_vmin:**
+        The minimum plotting value to use for the irradiance scatter.
+
+    """
+
+    sns.set_style("ticks")
+    frame_slice = (
+        data_to_plot.fillna(0).iloc[start_index : start_index + 24].set_index("hour")
     )
-    joint_plot_grid.ax_marg_y.set_xlim(0, irradiance_bar_vmax)
 
-    # Plot the scatter at the top of the plot.
-    joint_plot_grid.ax_marg_x.scatter(
-        np.arange(0.5, len(frame_slice.columns) + 0.5),
-        (cellwise_means := frame_slice.mean(axis=0).to_numpy()),
-        color="#144E56",
-        marker="D",
-        s=60,
-        alpha=0.7,
-    )
-    joint_plot_grid.ax_marg_x.set_ylim(irradiance_scatter_vmin, irradiance_scatter_vmax)
+    cell_to_temperature_profile_map: dict[float | int, list[float]] = {
+        pv_cell.cell_id: [
+            pv_cell.average_cell_temperature(
+                locations_to_weather_and_solar_map[scenario.location][time_of_day][
+                    TEMPERATURE
+                ]
+                + ZERO_CELSIUS_OFFSET,
+                1000 * frame_slice.iloc[time_of_day].iloc[pv_cell.cell_id],
+                0,
+            )
+            - ZERO_CELSIUS_OFFSET
+            for time_of_day in tqdm(
+                range(24), desc="Daily computation", leave=False, unit="hour"
+            )
+        ]
+        for pv_cell in tqdm(
+            scenario.pv_module.pv_cells,
+            desc="Cell-wise computation",
+            leave=False,
+            unit="cell",
+        )
+    }
+    temperature_frame = pd.DataFrame(cell_to_temperature_profile_map)
+    temperature_frame.columns = frame_slice.columns
 
-    joint_plot_grid.ax_joint.set_xlabel("Mean angle from polytunnel axis")
-    joint_plot_grid.ax_joint.set_ylabel("Hour of the day")
-    joint_plot_grid.ax_joint.set_title((initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y"))
-    joint_plot_grid.ax_joint.legend().remove()
+    if temperature_scatter_vmax is None:
+        temperature_scatter_vmax = 1.25 * (
+            max(
+                temperature_frame.mean(axis=0).max(),
+                0,
+            )
+        )
 
-    # Remove ticks from axes
-    joint_plot_grid.ax_marg_x.tick_params(axis="x", bottom=False, labelbottom=False)
-    joint_plot_grid.ax_marg_x.set_xlabel("Average irradiance / kWm$^{-2}$")
-    joint_plot_grid.ax_marg_y.tick_params(axis="y", left=False, labelleft=False)
-    # joint_plot_grid.ax_marg_y.set_xlabel("Average irradiance / kWm$^{-2}$")
-    # remove ticks showing the heights of the histograms
-    # joint_plot_grid.ax_marg_x.tick_params(axis='y', left=False, labelleft=False)
-    # joint_plot_grid.ax_marg_y.tick_params(axis='frame_slice', bottom=False, labelbottom=False)
+    with tqdm(desc="Plotting", leave=False, total=3, unit="steps") as pbar:
+        # Create a dummy plot and surrounding axes.
+        joint_plot_grid = sns.jointplot(
+            data=temperature_frame,
+            kind="hist",
+            bins=(len(temperature_frame.columns), 24),
+            marginal_ticks=True,
+        )
+        joint_plot_grid.ax_marg_y.cla()
+        joint_plot_grid.ax_marg_x.cla()
+        pbar.update(1)
 
-    joint_plot_grid.ax_marg_x.grid("on")
-    # joint_plot_grid.ax_marg_x.set_ylabel("Average irradiance")  #
+        # Generate the central heatmap.
+        sns.heatmap(
+            temperature_frame,
+            ax=joint_plot_grid.ax_joint,
+            cmap="coolwarm",
+            vmin=0,
+            vmax=heatmap_vmax,
+            cbar=True,
+            cbar_kws={"label": "Temperature / $^\circ$C"},
+        )
+        pbar.update(1)
 
-    joint_plot_grid.figure.tight_layout()
+        # Plot the irradiance bars on the RHS of the plot.
+        joint_plot_grid.ax_marg_y.barh(
+            np.arange(0.5, 24.5), temperature_frame.mean(axis=1).to_numpy(), color="red"
+        )
+        joint_plot_grid.ax_marg_y.set_xlim(0, temperature_bar_vmax)
 
-    # Adjust the plot such that the colourbar appears to the RHS.
-    # Solution from JohanC (https://stackoverflow.com/users/12046409/johanc)
-    # Obtained with permission from stackoverflow:
-    # https://stackoverflow.com/questions/60845764/how-to-add-a-colorbar-to-the-side-of-a-kde-jointplot
-    #
-    plt.subplots_adjust(left=0.1, right=0.8, top=0.9, bottom=0.1)
-    pos_joint_ax = joint_plot_grid.ax_joint.get_position()
-    pos_marg_x_ax = joint_plot_grid.ax_marg_x.get_position()
-    joint_plot_grid.ax_joint.set_position(
-        [pos_joint_ax.x0, pos_joint_ax.y0, pos_marg_x_ax.width, pos_joint_ax.height]
-    )
-    joint_plot_grid.figure.axes[-1].set_position(
-        [0.83, pos_joint_ax.y0, 0.07, pos_joint_ax.height]
-    )
+        # Plot the scatter at the top of the plot.
+        joint_plot_grid.ax_marg_x.scatter(
+            np.arange(0.5, len(temperature_frame.columns) + 0.5),
+            (cellwise_means := temperature_frame.mean(axis=0).to_numpy()),
+            color="red",
+            marker="D",
+            s=60,
+            alpha=0.7,
+        )
+        joint_plot_grid.ax_marg_x.set_ylim(
+            temperature_scatter_vmin, temperature_scatter_vmax
+        )
 
-    # Save the figure in high- and low-resolution formats.
-    plt.savefig(
-        f"{figname}.{fig_format}",
-        transparent=True,
-        format=fig_format,
-        dpi=300,
-        bbox_inches="tight",
-    )
-    plt.savefig(
-        f"{figname}.png",
-        transparent=True,
-        format="png",
-        dpi=300,
-        bbox_inches="tight",
-    )
+        joint_plot_grid.ax_joint.set_xlabel("Mean angle from polytunnel axis")
+        joint_plot_grid.ax_joint.set_ylabel("Hour of the day")
+        joint_plot_grid.ax_joint.set_title(
+            (initial_date + timedelta(hours=start_index)).strftime("%d/%m/%Y"),
+            fontweight="bold",
+        )
+        joint_plot_grid.ax_joint.legend().remove()
 
-    if show_figure:
-        plt.show()
+        # Remove ticks from axes
+        joint_plot_grid.ax_marg_x.tick_params(axis="x", bottom=False, labelbottom=False)
+        joint_plot_grid.ax_marg_x.set_xlabel("Average temperature / $^\circ$C")
+        joint_plot_grid.ax_marg_y.tick_params(axis="y", left=False, labelleft=False)
+        # joint_plot_grid.ax_marg_y.set_xlabel("Average irradiance / kWm$^{-2}$")
+        # remove ticks showing the heights of the histograms
+        # joint_plot_grid.ax_marg_x.tick_params(axis='y', left=False, labelleft=False)
+        # joint_plot_grid.ax_marg_y.tick_params(axis='frame_slice', bottom=False, labelbottom=False)
+
+        joint_plot_grid.ax_marg_x.grid("on")
+        # joint_plot_grid.ax_marg_x.set_ylabel("Average irradiance")  #
+
+        joint_plot_grid.figure.tight_layout()
+
+        # Adjust the plot such that the colourbar appears to the RHS.
+        # Solution from JohanC (https://stackoverflow.com/users/12046409/johanc)
+        # Obtained with permission from stackoverflow:
+        # https://stackoverflow.com/questions/60845764/how-to-add-a-colorbar-to-the-side-of-a-kde-jointplot
+        #
+        plt.subplots_adjust(left=0.1, right=0.8, top=0.9, bottom=0.1)
+        pos_joint_ax = joint_plot_grid.ax_joint.get_position()
+        pos_marg_x_ax = joint_plot_grid.ax_marg_x.get_position()
+        joint_plot_grid.ax_joint.set_position(
+            [pos_joint_ax.x0, pos_joint_ax.y0, pos_marg_x_ax.width, pos_joint_ax.height]
+        )
+        joint_plot_grid.figure.axes[-1].set_position(
+            [0.83, pos_joint_ax.y0, 0.07, pos_joint_ax.height]
+        )
+
+        # Save the figure in high- and low-resolution formats.
+        plt.savefig(
+            f"{figname}.{fig_format}",
+            format=fig_format,
+            bbox_inches="tight",
+            pad_inches=0,
+        )
+
+        if show_figure:
+            plt.show()
+
+        pbar.update(1)
 
 
 def save_daily_results(date_str, data, scenario_name):
@@ -1087,6 +1628,9 @@ def main(unparsed_arguments) -> None:
     """
     Main method for Polytunnel-PV.
 
+    :param: unparsed_arguments
+        Un-parsed command-line arguments.
+
     """
 
     # Snippet taken with permission from CLOVER-energy/CLOVER
@@ -1138,7 +1682,7 @@ def main(unparsed_arguments) -> None:
     # Parse the weather data.
     # NOTE: When integrated this as a Python package, this line should be suppressable
     # by weather data being passed in.
-    weather_data = _parse_solar()
+    weather_data = _parse_weather()
     print(DONE)
 
     # Map locations to weather data.
@@ -1222,117 +1766,10 @@ def main(unparsed_arguments) -> None:
         + " ",
         end="",
     )
-    skipped: dict[Scenario.name,bool] = dict(zip([scenario.name for scenario in scenarios],[False for scenario in scenarios]))
-    for scenario in scenarios:
-        cellwise_irradiances = []
-        if not os.path.isfile(
-            (
-                cellwise_filename := os.path.join(
-                    "auto_generated", f"{scenario.name}_cellwise_irradiance.csv"
-                )
-            )
-        ):
-            try:
-                cellwise_irradiances.append(
-                    (
-                        scenario,
-                        [
-                            {
-                                entry[LOCAL_TIME]: get_irradiance(
-                                    pv_cell,
-                                    entry[IRRADIANCE_DIFFUSE],
-                                    entry[IRRADIANCE_GLOBAL_HORIZONTAL],
-                                    entry[SOLAR_AZIMUTH],
-                                    entry[SOLAR_ZENITH],
-                                    direct_normal_irradiance=entry[
-                                        IRRADIANCE_DIRECT_NORMAL
-                                    ],
-                                )
-                                for entry in locations_to_weather_and_solar_map[
-                                    scenario.location
-                                ]
-                            }
-                            for pv_cell in scenario.pv_module.pv_cells
-                        ],
-                    )
-                )
-            except KeyError as key_error:
-                raise KeyError(
-                    "Unable to find weather data for location specified by the scenario. Check "
-                    "you have downloaded it and saved it correctly." + str(key_error)
-                ) from None
-
-            # Transform to a pandas DataFrame for plotting.
-            cellwise_irradiance_frames: list[tuple[Scenario, pd.DataFrame]] = []
-            for scenario, irradiances_list in cellwise_irradiances:
-                hourly_frames: list[pd.DataFrame] = []
-                for cell_id, hourly_irradiances in enumerate(irradiances_list):
-                    hourly_frame = pd.DataFrame.from_dict(
-                        hourly_irradiances, orient="index"
-                    )
-                    hourly_frame.columns = pd.Index([cell_id])
-                    hourly_frames.append(hourly_frame)
-
-                combined_frame = pd.concat(hourly_frames, axis=1)
-                combined_frame.sort_index(axis=1, inplace=True, ascending=False)
-                combined_frame["hour"] = [
-                    int(entry.split(" ")[1].split(":")[0])
-                    for entry in hourly_frame.index.to_series()
-                ]
-
-                # Use the cell angle from the axis as the column header
-                combined_frame.columns = [
-                    f"{'-' if pv_cell.cell_id / len(scenario.pv_module.pv_cells) < 0.5 else ''}{str(round(pv_cell.tilt, 3))}"
-                    for pv_cell in scenario.pv_module.pv_cells
-                ] + ["hour"]
-
-                combined_frame = combined_frame.reset_index().rename(columns={"index": (date_and_time := "date_and_time")})
-                
-                with open(
-                    os.path.join(
-                        "auto_generated", f"{scenario.name}_cellwise_irradiance.csv"
-                    ),
-                    "w",
-                ) as f:
-                    combined_frame.to_csv(f, index=False)
-
-            cellwise_irradiance_frames.append((scenario, combined_frame))
-
-        else:
-            skipped[scenario.name] = True
-            continue
-            
-
-    if all(skipped.values()):
-        print("Skipping calculation of irradiance and using irradiance from file")
-
-        cellwise_irradiance_frames = []
-
-        for scenario in tqdm(scenarios, desc="Loading irradiance data", leave=True):
-            with open(
-                os.path.join(
-                    "auto_generated", f"{scenario.name}_cellwise_irradiance.csv"
-                ),
-                "r",
-            ) as f:
-                combined_frame = pd.read_csv(f, index_col=None)
-                
-
-            combined_frame.columns = pd.Index([(date_and_time:="date_and_time")] + list(combined_frame.columns)[1:])
-            cellwise_irradiance_frames.append((scenario, combined_frame.copy()))
-
-        print(DONE)
-    else:
-        print(DONE)
-
-    # Defragment the frame
-    cellwise_irradiance_frames = [
-        (entry[0], entry[1].copy()) for entry in cellwise_irradiance_frames
-    ]
-
-    # Extract the information for just the scenario that should be plotted.
+    # Load cell-wise irradiance data if already computed for the scenario being modelled
+    # Otherwise, compute the irradiance data
     try:
-        scenario = {scenario.name: scenario for scenario in scenarios}[
+        modelling_scenario = {scenario.name: scenario for scenario in scenarios}[
             parsed_args.scenario
         ]
     except KeyError:
@@ -1344,9 +1781,105 @@ def main(unparsed_arguments) -> None:
             f"Scenario {parsed_args.scenario.name} not found in scenarios file. Valid scenarios: {', '.join([s.name for s in scenarios])}"
         ) from None
 
+    cellwise_irradiance_frames: list[tuple[Scenario, pd.DataFrame]] = []
+
+    if (
+        not os.path.isfile(
+            (
+                cellwise_filename := os.path.join(
+                    "auto_generated",
+                    f"{modelling_scenario.name}_cellwise_irradiance.csv",
+                )
+            )
+        )
+        or parsed_args.regenerate
+    ):
+        irradiances_list = [
+            {
+                entry[TIME]: get_irradiance(
+                    pv_cell,
+                    entry[IRRADIANCE_DIFFUSE],
+                    entry[IRRADIANCE_GLOBAL_HORIZONTAL],
+                    entry[SOLAR_AZIMUTH],
+                    entry[SOLAR_ZENITH],
+                    direct_normal_irradiance=entry[IRRADIANCE_DIRECT_NORMAL],
+                )
+                for entry in tqdm(
+                    locations_to_weather_and_solar_map[modelling_scenario.location][
+                        :8760
+                    ],
+                    desc="Performing hourly calculation",
+                    leave=False,
+                )
+            }
+            for pv_cell in tqdm(
+                modelling_scenario.pv_module.pv_cells,
+                desc="Cell-wise irradiance",
+                leave=False,
+            )
+        ]
+
+        hourly_frames: list[pd.DataFrame] = []
+        for cell_id, hourly_irradiances in enumerate(irradiances_list):
+            hourly_frame = pd.DataFrame.from_dict(hourly_irradiances, orient="index")
+            hourly_frame.columns = pd.Index([cell_id])
+            hourly_frames.append(hourly_frame)
+
+        combined_frame = pd.concat(hourly_frames, axis=1)
+        combined_frame.sort_index(axis=1, inplace=True, ascending=False)
+
+        combined_frame["hour"] = [
+            int(entry.split(" ")[1].split(":")[0])
+            for entry in hourly_frame.index.to_series()
+        ]
+
+        # Use the cell angle from the axis as the column header
+        combined_frame.columns = [
+            f"{'-' if pv_cell.cell_id / len(modelling_scenario.pv_module.pv_cells) < 0.5 else ''}{str(round(pv_cell.tilt, 3))}"
+            for pv_cell in modelling_scenario.pv_module.pv_cells
+        ] + ["hour"]
+
+        with open(
+            cellwise_filename,
+            "w",
+        ) as cellwise_file:
+            combined_frame.to_csv(cellwise_file, index=None)
+
+        cellwise_irradiance_frames.append((modelling_scenario, combined_frame))
+
+        print(DONE)
+
+    else:
+        for scenario in tqdm(
+            [scenario for scenario in scenarios if scenario == modelling_scenario],
+            desc="Loading irradiance data",
+            leave=True,
+        ):
+            with open(
+                os.path.join(
+                    "auto_generated", f"{scenario.name}_cellwise_irradiance.csv"
+                ),
+                "r",
+            ) as f:
+                combined_frame = pd.read_csv(f, index_col=None)
+
+            # combined_frame.columns = pd.Index(
+            #     [(date_and_time := "date_and_time")] + list(combined_frame.columns)[1:]
+            # )
+            cellwise_irradiance_frames.append((scenario, combined_frame.copy()))
+
+        print(DONE)
+
+    # Defragment the frame
+    cellwise_irradiance_frames = [
+        (entry[0], entry[1].copy()) for entry in cellwise_irradiance_frames
+    ]
+
     try:
         irradiance_frame = [
-            entry[1] for entry in cellwise_irradiance_frames if entry[0] == scenario
+            entry[1]
+            for entry in cellwise_irradiance_frames
+            if entry[0] == modelling_scenario
         ][0]
         #print(f"DEBUG: irradiance frame {irradiance_frame.iloc[0:25,:3]}")
     except IndexError:
@@ -1356,329 +1889,3286 @@ def main(unparsed_arguments) -> None:
         sns.cubehelix_palette(
             start=-0.2,
             rot=-0.2,
-            n_colors=len(scenario.pv_module.pv_cells_and_cell_strings),
+            n_colors=len(modelling_scenario.pv_module.pv_cells_and_cell_strings),
         )
     )
 
     # Fix nan errors:
+    initial_time = datetime.strptime(
+        weather_data[location.name][TIME][0], "%Y-%m-%d %H:%M"
+    )
     irradiance_frame = irradiance_frame.fillna(0)
-    
-    # print(irradiance_frame.iloc[-48:,-3:])
-    
-    # # Check for invalid start date or iteration length values:
-    # try:
-    #     print(irradiance_frame.iloc[parsed_args.start_day_index])
-    #     print(irradiance_frame.iloc[parsed_args.start_day_index+parsed_args.iteration_length])
-        
-    # except IndexError:
-    #     raise IndexError(
-    #         "Start day and iteration length combination not possible, index out of bounds."
-    #     ) from None
-    
-    # print(locations_to_weather_and_solar_map[scenario.location])
-        
+    os.makedirs(OUTPUT_DIRECTORY, exist_ok=True)
 
-    daily_data = defaultdict(list)
+    # Determine what type of operation to carry out.
+    try:
+        operating_mode = OperatingMode(parsed_args.operating_mode)
+    except ValueError:
+        raise ValueError(
+            f"Invalid operating mode specified: {parsed_args.operating_mode}"
+        ) from None
 
-    output_directory = "outputs"
-    if not os.path.exists(output_directory):
-        os.makedirs(output_directory)
-    
-    # Check if data has already been processed for each scenario
-    if not os.path.isfile(
-        (
-            mpp_filename := os.path.join(
-                output_directory, f"mpp_daily_summary_{scenario.name}_{parsed_args.start_day_index}_{parsed_args.start_day_index+parsed_args.iteration_length}.xlsx"
-                )
-        )
-    ):
-        # Calculate interpolation array
-        irradiance_spectrum = np.linspace(2,1500,101)
-        temperature_spectrum = np.linspace(5,80,51)
-        voltage_interp_array, param_grid = create_voltage_interpolating_array(
-                                    irradiance_points=irradiance_spectrum,
-                                    temperature_points=temperature_spectrum,
-                                    scenario=scenario,
-                                )   
-        print("Calculation of interpolation array....DONE")
-        
-        
-        
-        # Use joblib to parallelize the for loop
-        start_time = time.time()
-        with tqdm(
-            desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
-        ) as pbar:
-            # with ThreadPool(8) as mpool:
-            #     results_map = mpool.map(
-            #         functools.partial(
-            #             process_single_mpp_calculation,
-            #             irradiance_frame=irradiance_frame,
-            #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-            #             pbar=pbar,
-            #             pv_system=pv_system,
-            #             scenario=scenario,
-            #         ),
-            #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
+    match operating_mode.value:
+        case OperatingMode.HOURLY_MPP.value:
+            ################################
+            # Parallelised MPP computation #
+            ################################
+
+            # _, mpp_power, bypassed_cell_strings = (
+            #     process_single_mpp_calculation_without_pbar(
+            #         parsed_args.start_day_index,
+            #         irradiance_frame=irradiance_frame,
+            #         locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+            #         pv_system=pv_system,
+            #         scenario=modelling_scenario,
             #     )
+            # )
 
-            results = Parallel(n_jobs=8)(
-                delayed(
-                    functools.partial(
-                        process_single_mpp_calculation_without_pbar,
-                        irradiance_frame=irradiance_frame,
-                        locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
-                        pv_system=pv_system,
-                        scenario=scenario,
-                        voltage_interp_array=voltage_interp_array,
-                        param_grid=param_grid,
+            # Use joblib to parallelize the for loop
+            start_time = time.time()
+            print(
+                (this_string := "Parallel MPP computation")
+                + "." * (88 - (len(this_string) + len(DONE)))
+                + " ",
+                end="",
+            )
+            with tqdm(
+                desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
+            ) as pbar:
+                # with ThreadPool(8) as mpool:
+                #     results_map = mpool.map(
+                #         functools.partial(
+                #             process_single_mpp_calculation,
+                #             irradiance_frame=irradiance_frame,
+                #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                #             pbar=pbar,
+                #             pv_system=pv_system,
+                #             scenario=modelling_scenario,
+                #         ),
+                #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
+                #     )
+
+                results = Parallel(n_jobs=8)(
+                    delayed(
+                        functools.partial(
+                            process_single_mpp_calculation_without_pbar,
+                            irradiance_frame=irradiance_frame,
+                            locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                            pv_system=pv_system,
+                            scenario=modelling_scenario,
+                        )
+                    )(time_of_day)
+                    for time_of_day in range(
+                        parsed_args.start_day_index,
+                        parsed_args.start_day_index + parsed_args.iteration_length,
                     )
-                )(time_of_day)
-                for time_of_day in range(
-                    parsed_args.start_day_index,
-                    parsed_args.start_day_index + parsed_args.iteration_length,
+                )
+
+            end_time = time.time()
+            print(DONE)
+            print(f"Parallel processing took {end_time - start_time:.2f} seconds")
+
+            # Process results and accumulate daily data
+            all_mpp_data: list[
+                tuple[
+                    str,
+                    int,
+                    dict[BypassedCellString | PVCell, bool],
+                    dict[BypassedCellString | PVCell, float],
+                ]
+            ] = []
+
+            daily_data = defaultdict(list)
+            for result in results:
+                if result is not None:
+                    hour, mpp_power, bypassed_cell_strings, cellwise_mpp = result
+                    if mpp_power is not None:
+                        daily_data[
+                            (
+                                date_str := (
+                                    initial_time + timedelta(hours=hour)
+                                ).strftime("%d/%m/%Y")
+                            )
+                        ].append((hour, mpp_power))
+                        all_mpp_data.append(
+                            (
+                                date_str,
+                                hour,
+                                mpp_power,
+                                bypassed_cell_strings,
+                                cellwise_mpp,
+                            )
+                        )
+
+            all_mpp_data = [
+                [
+                    entry[0],
+                    entry[1],
+                    entry[2],
+                    {key.cell_id: bool(value) for key, value in entry[3].items()},
+                    {key.cell_id: value for key, value in entry[4].items()},
+                ]
+                for entry in all_mpp_data
+            ]
+
+            # Save the output data
+            with open(
+                os.path.join(
+                    OUTPUT_DIRECTORY,
+                    f"hourly_mpp_{modelling_scenario.name}_"
+                    f"{(start_hour:=parsed_args.start_day_index)}_to_"
+                    f"{(end_hour:=start_hour + parsed_args.iteration_length)}.json",
+                ),
+                "w",
+                encoding="UTF-8",
+            ) as output_file:
+                json.dump(all_mpp_data, output_file, indent=4)
+
+            # Generate a heatmap of whether the power generation in the cells.
+            cellwise_mpp_frame = pd.DataFrame(
+                {entry[1]: entry[4].values() for entry in all_mpp_data}
+            ).transpose()
+            (cmap_greens := plt.get_cmap("Oranges").copy()).set_under("none")
+            (cmap_purples := plt.get_cmap("Blues").copy()).set_under("none")
+
+            plt.figure(figsize=(40 / 5, 32 / 5))
+            sns.heatmap(
+                cellwise_mpp_frame,
+                cmap=cmap_greens,
+                cbar_kws={"label": "Power generation in cells / W"},
+                square=True,
+                vmin=0,
+            )
+            sns.heatmap(
+                -cellwise_mpp_frame,
+                cmap=cmap_purples,
+                cbar_kws={"label": "Power dissipation in cells / W"},
+                square=True,
+                vmin=0,
+            )
+            plt.savefig(
+                f"cellwise_mpp_{modelling_scenario.name}_{start_hour}_{end_hour}."
+                f"{(fig_format:='pdf')}",
+                format=fig_format,
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            # plt.show()
+
+            # Generate a heatmap of whether the cells were in reverse bias.
+            reverse_bias_frame = (
+                pd.DataFrame({entry[1]: entry[3].values() for entry in all_mpp_data})
+                .transpose()
+                .astype(bool)
+            )
+            reverse_bias_frame = (
+                reverse_bias_frame.astype(str)
+                .replace("0", None)
+                .replace("False", 0)
+                .replace("false", 0)
+                .replace("True", 1)
+            )
+
+            sns.heatmap(reverse_bias_frame, cmap="PiYG_r", square=True, vmin=0, vmax=1)
+            plt.savefig(
+                f"cellwise_reverse_bias_{modelling_scenario.name}_{start_hour}_"
+                f"{end_hour}.{(fig_format:='pdf')}",
+                format=fig_format,
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            # plt.show()
+
+        case OperatingMode.HOURLY_MPP_MACHINE_LEARNING_TRAING.value:
+            #################################
+            # BSc. Machine Learning Project #
+            #################################
+
+            # Open the data from the training data-set file if it already exists,
+            # otherwise, construct new data.
+            if os.path.isfile((filename := "training_data_hours.csv")):
+                training_data_hours = pd.read_csv(filename)
+                # pd.DataFrame
+                # 0, 0
+                # 1, 0
+                # ...
+                # 8, 1
+                # 9, 0
+            else:
+                # Compute a series of random hours throughout the year
+                # Save them to the file
+                pass
+
+            # Split the weather data into training and test data.
+
+            # Use joblib to parallelize the for loop
+            start_time = time.time()
+            print(
+                (this_string := "Parallel MPP computation")
+                + "." * (88 - (len(this_string) + len(DONE)))
+                + " ",
+                end="",
+            )
+            with tqdm(
+                desc="MPP computation", total=parsed_args.iteration_length, unit="hour"
+            ) as pbar:
+                # with ThreadPool(8) as mpool:
+                #     results_map = mpool.map(
+                #         functools.partial(
+                #             process_single_mpp_calculation,
+                #             irradiance_frame=irradiance_frame,
+                #             locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                #             pbar=pbar,
+                #             pv_system=pv_system,
+                #             scenario=modelling_scenario,
+                #         ),
+                #         range(parsed_args.start_day_index, parsed_args.start_day_index + parsed_args.iteration_length),
+                #     )
+
+                results = Parallel(n_jobs=8)(
+                    delayed(
+                        functools.partial(
+                            process_single_mpp_calculation_without_pbar,
+                            irradiance_frame=irradiance_frame,
+                            locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                            pv_system=pv_system,
+                            scenario=modelling_scenario,
+                        )
+                    )(time_of_day)
+                    for time_of_day in range(
+                        parsed_args.start_day_index,
+                        parsed_args.start_day_index + parsed_args.iteration_length,
+                    )
+                )
+
+            end_time = time.time()
+            print(DONE)
+            print(f"Parallel processing took {end_time - start_time:.2f} seconds")
+
+            # Process results and accumulate daily data
+            all_mpp_data: list[
+                tuple[
+                    str,
+                    int,
+                    dict[BypassedCellString | PVCell, bool],
+                    dict[BypassedCellString | PVCell, float],
+                ]
+            ] = []
+
+            daily_data = defaultdict(list)
+            for result in results:
+                if result is not None:
+                    hour, mpp_power, bypassed_cell_strings, cellwise_mpp = result
+                    if mpp_power is not None:
+                        daily_data[
+                            (
+                                date_str := (
+                                    initial_time + timedelta(hours=hour)
+                                ).strftime("%d/%m/%Y")
+                            )
+                        ].append((hour, mpp_power))
+                        all_mpp_data.append(
+                            (
+                                date_str,
+                                hour,
+                                mpp_power,
+                                bypassed_cell_strings,
+                                cellwise_mpp,
+                            )
+                        )
+
+            def _process_bypassing(entry_to_process: bool | None) -> None:
+                """
+                Process the bypass-diode.
+
+                :param: entry_to_process
+                    The entry to process.
+
+                :returns: The processed entry.
+
+                """
+
+                if entry_to_process == "0":
+                    return None
+                if entry_to_process == "False":
+                    return 0
+                return 1
+
+            all_mpp_data = [
+                [
+                    entry[0],
+                    entry[1],
+                    entry[2],
+                    {
+                        key.cell_id: _process_bypassing(str(value))
+                        for key, value in entry[3].items()
+                    },
+                    {key.cell_id: value for key, value in entry[4].items()},
+                ]
+                for entry in all_mpp_data
+            ]
+
+            # Save the output data
+            with open(
+                os.path.join(
+                    OUTPUT_DIRECTORY,
+                    f"hourly_mpp_{scenario.name}_"
+                    f"{(start_hour:=parsed_args.start_day_index)}_to_"
+                    f"{(end_hour:=start_hour + parsed_args.iteration_length)}.json",
+                ),
+                "w",
+                encoding="UTF-8",
+            ) as output_file:
+                json.dump(all_mpp_data, output_file)
+
+            training_data = results[training_hours]
+
+            # Week 3 only: Select the machine-learning algorithm from either an argument
+            # that we take in on the command-line, in Python, or from some file, or we
+            # go through a list of different algorithms.
+
+            # Run the code, in a parallel loop, to develop a machine-learning object
+            # which is trained on the training data.
+
+            # Use the test data to assess how well it worked.
+
+            # Save all the objects and the results.
+
+        case OperatingMode.IRRADIANCE_LINEPLOTS.value:
+            ################################
+            # Irradiance lineplot plotting #
+            ################################
+
+            # Line plot of the irradiance throughout the day.
+            sns.set_palette(
+                sns.color_palette(
+                    [
+                        "#8F1838",
+                        "#C11F33",
+                        "#EA1D2D",
+                        "#F36E24",
+                        "#F99D25",
+                        "#FDB714",
+                        "#00ACD7",
+                        "#007DBB",
+                        "#00558A",
+                        "#1A3668",
+                        "#48773C",
+                        "#40AE49",
+                    ]
+                )
+            )
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            dashes = Dashes()
+
+            for time_of_day in tqdm(
+                range(
+                    (start_hour := parsed_args.start_day_index),
+                    (
+                        end_hour := parsed_args.start_day_index
+                        + parsed_args.iteration_length
+                    ),
+                ),
+                desc="Plotting irradiance series",
+            ):
+                sns.lineplot(
+                    x=[
+                        pv_cell.cell_id
+                        for pv_cell in modelling_scenario.pv_module.pv_cells
+                    ],
+                    y=[
+                        1000
+                        * irradiance_frame.set_index("hour")
+                        .iloc[time_of_day]
+                        .values[pv_cell.cell_id]
+                        for pv_cell in modelling_scenario.pv_module.pv_cells
+                    ],
+                    # color="orange",
+                    # marker="h",
+                    # s=100,
+                    # alpha=0.35,
+                    dashes=next(dashes),
+                    label=_sanitise_time(time_of_day, "%H:%M", initial_time),
+                )
+
+            plt.xlabel("Cell ID")
+            plt.ylabel("Irradiance / W/m$^2$")
+            # plt.legend().remove()
+            plt.legend()
+
+            # norm = plt.Normalize(
+            #     int(_sanitise_time(start_hour, "%H", initial_time)),
+            #     int(_sanitise_time(end_hour - 1, "%H", initial_time)) + 1,
+            # )
+            # scalar_mappable = plt.cm.ScalarMappable(
+            #     cmap=mcolors.LinearSegmentedColormap.from_list(
+            #         "Custom", sns.color_palette().as_hex(), parsed_args.iteration_length
+            #     ),
+            #     norm=norm,
+            # )
+
+            # colorbar = (axis := plt.gca()).figure.colorbar(
+            #     scalar_mappable,
+            #     ax=axis,
+            #     label="Hour of the day",
+            #     pad=(_pad := 0.025),
+            # )
+            # plt.title((initial_time + timedelta(hours=plotting_time_of_day)).strftime("%H:%M on %d/%m/%Y"))
+            plt.savefig(
+                f"irradiance_graph_{modelling_scenario.name}_{start_hour}_{end_hour}."
+                f"{(fig_format:='pdf')}",
+                format=fig_format,
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            dashes = Dashes()
+
+            for time_of_day in tqdm(
+                range(start_hour, end_hour),
+                desc="Plotting temperature series",
+            ):
+                plt.plot(
+                    [
+                        pv_cell.cell_id
+                        for pv_cell in modelling_scenario.pv_module.pv_cells
+                    ],
+                    [
+                        pv_cell.average_cell_temperature(
+                            locations_to_weather_and_solar_map[
+                                modelling_scenario.location
+                            ][time_of_day][TEMPERATURE]
+                            + ZERO_CELSIUS_OFFSET,
+                            1000
+                            * irradiance_frame.set_index("hour")
+                            .iloc[time_of_day]
+                            .iloc[pv_cell.cell_id],
+                            0,
+                        )
+                        - ZERO_CELSIUS_OFFSET
+                        for pv_cell in modelling_scenario.pv_module.pv_cells
+                    ],
+                    # color="orange",
+                    # marker="h",
+                    # s=100,
+                    # alpha=0.35,
+                    dashes=next(dashes),
+                    label=_sanitise_time(time_of_day, "%H:%M", initial_time),
+                )
+
+            plt.xlabel("Cell ID")
+            plt.ylabel("Temperature / Degrees Celsius")
+            plt.legend()
+            # plt.legend().remove()
+
+            # norm = plt.Normalize(
+            #     int(_sanitise_time(start_hour, "%H", initial_time)),
+            #     int(_sanitise_time(end_hour - 1, "%H", initial_time)) + 1,
+            # )
+            # scalar_mappable = plt.cm.ScalarMappable(
+            #     cmap=mcolors.LinearSegmentedColormap.from_list(
+            #         "Custom", sns.color_palette().as_hex(), parsed_args.iteration_length
+            #     ),
+            #     norm=norm,
+            # )
+
+            # (axis := plt.gca()).figure.colorbar(
+            #     scalar_mappable,
+            #     ax=axis,
+            #     label="Hour of the day",
+            #     pad=(_pad := 0.025),
+            # )
+            # plt.title((initial_time + timedelta(hours=plotting_time_of_day)).strftime("%H:%M on %d/%m/%Y"))
+            plt.savefig(
+                f"temperature_graph_{modelling_scenario.name}_{start_hour}_{end_hour}."
+                f"{(fig_format:='pdf')}",
+                format=fig_format,
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+        case OperatingMode.IRRADIANCE_HEATMAPS.value:
+            ###############################
+            # Irradiance heatmap plotting #
+            ###############################
+
+            try:
+                scenario_index: int = [
+                    index
+                    for index, scenario in enumerate(scenarios)
+                    if scenario.name == parsed_args.scenario
+                ][0]
+            except IndexError:
+                raise IndexError(
+                    "Unable to find current scenario weather information."
+                ) from None
+
+            frame_to_plot = cellwise_irradiance_frames[0][1]
+            plot_irradiance_with_marginal_means(
+                frame_to_plot,
+                start_index=(start_hour := parsed_args.start_day_index),
+                figname=f"{scenario.name}_{parsed_args.start_day_index}_irradiance",
+                heatmap_vmax=(
+                    1.0
+                    # frame_to_plot.set_index("hour")
+                    # .iloc[start_hour : start_hour + 24]
+                    # .max()
+                    # .max()
+                ),
+                initial_date=initial_time,
+                irradiance_bar_vmax=(
+                    1.0
+                    # max(
+                    #     frame_to_plot.set_index("hour")
+                    #     .iloc[start_hour : start_hour + 24]
+                    #     .mean(axis=1)
+                    #     .max(),
+                    #     0,
+                    # )
+                ),
+                irradiance_scatter_vmin=0,
+                irradiance_scatter_vmax=(
+                    1.25
+                    # * (
+                    #     max(
+                    #         frame_to_plot.set_index("hour")
+                    #         .iloc[start_hour : start_hour + 24]
+                    #         .mean(axis=0)
+                    #         .max(),
+                    #         0,
+                    #     )
+                    # )
+                ),
+                show_figure=True,
+            )
+
+            plot_temperature_with_marginal_means(
+                frame_to_plot,
+                start_index=(start_hour := parsed_args.start_day_index),
+                figname=f"{scenario.name}_{parsed_args.start_day_index}_temperature",
+                heatmap_vmax=80,
+                initial_date=initial_time,
+                locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                scenario=scenario,
+                show_figure=True,
+                temperature_bar_vmax=80,
+                temperature_scatter_vmax=80,
+            )
+
+        case OperatingMode.IV_CURVES.value:
+            ##############################################
+            # Plot IV curves for the cells in the module #
+            ##############################################
+
+            time_of_day = parsed_args.start_day_index
+
+            current_series = np.linspace(
+                0,
+                1.1
+                * max(
+                    [
+                        pv_cell.short_circuit_current
+                        for pv_cell in modelling_scenario.pv_module.pv_cells
+                    ]
+                ),
+                VOLTAGE_RESOLUTION,
+            )
+
+            # Maps for plotting curves
+            cell_to_current_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+            cell_to_voltage_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+            cell_to_bypass_current_map: dict[
+                BypassedCellString | PVCell, np.ndarray
+            ] = {}
+            cell_to_bypass_voltage_map: dict[
+                BypassedCellString | PVCell, np.ndarray
+            ] = {}
+
+            # Maps for computing the MPP
+            mpp_cell_to_current_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+            mpp_cell_to_voltage_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+            mpp_cell_to_power_map: dict[BypassedCellString | PVCell, np.ndarray] = {}
+            mpp_cell_to_bypass_operating: dict[
+                BypassedCellString | PVCell, np.ndarray
+            ] = {}
+
+            for pv_cell in tqdm(
+                modelling_scenario.pv_module.pv_cells_and_cell_strings,
+                desc="IV calculation",
+                leave=False,
+            ):
+                (
+                    current_series,
+                    power_series,
+                    voltage_series,
+                    bypass_diode_operating,
+                ) = pv_cell.calculate_iv_curve(
+                    (
+                        weather_map := locations_to_weather_and_solar_map[
+                            modelling_scenario.location
+                        ][time_of_day]
+                    )[TEMPERATURE],
+                    1000
+                    * irradiance_frame.set_index("hour")
+                    .iloc[time_of_day]
+                    .reset_index(drop=True),
+                    weather_map[WIND_SPEED],
+                    current_series=current_series,
+                )
+
+                mpp_cell_to_current_map[pv_cell] = current_series
+                mpp_cell_to_voltage_map[pv_cell] = voltage_series
+                mpp_cell_to_power_map[pv_cell] = power_series
+                mpp_cell_to_bypass_operating[pv_cell] = bypass_diode_operating
+
+            time_string = (initial_time + timedelta(hours=time_of_day)).strftime(
+                "%d_%m_%y_at_%H_%M"
+            )
+
+            # Plot the IV curves across the module, along with the power that each
+            # bypassed group produces
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            left_axis = plt.gca()
+            right_axis = left_axis.twinx()
+
+            for index, pv_cell in enumerate(
+                modelling_scenario.pv_module.pv_cells_and_cell_strings
+            ):
+                left_axis.plot(
+                    mpp_cell_to_voltage_map[pv_cell],
+                    mpp_cell_to_current_map[pv_cell],
+                    label=pv_cell.cell_id,
+                    color=f"C{index}",
+                )
+                right_axis.plot(
+                    mpp_cell_to_voltage_map[pv_cell],
+                    mpp_cell_to_power_map[pv_cell],
+                    "--",
+                    label=pv_cell.cell_id,
+                    color=f"C{index}",
+                )
+
+            left_axis.set_ylim(bottom=-2.5, top=10)
+            right_axis.set_ylim(bottom=-10, top=40)
+            left_axis.legend(title="Initial index of cell in string", ncol=4)
+            plt.xlabel("Cell-wise, or cell-string-wise, voltage / V")
+            left_axis.set_ylabel("Module current / A")
+            right_axis.set_ylabel("Cell-wise, or cell-string-wise, power / W")
+
+            plt.savefig(
+                f"iv_curves_with_power_{time_string}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            # Plot the IV curves across the module as current and power only.
+            plt.figure(figsize=(48 / 5, 32 / 5))
+
+            for index, pv_cell in enumerate(
+                modelling_scenario.pv_module.pv_cells_and_cell_strings
+            ):
+                plt.plot(
+                    mpp_cell_to_voltage_map[pv_cell],
+                    mpp_cell_to_current_map[pv_cell],
+                    label=pv_cell.cell_id,
+                    color=f"C{index}",
+                )
+
+            plt.ylim(bottom=0, top=10)
+            plt.legend(title="Initial index of cell in string", ncol=4)
+            plt.xlabel("Cell-wise, or cell-string-wise, voltage / V")
+            plt.ylabel("Module current / A")
+
+            plt.savefig(
+                f"iv_curves_{time_string}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            # Compute the total power produced
+            cell_voltage_interpreters = {
+                pv_cell: lambda i, pv_cell=pv_cell: np.interp(
+                    i,
+                    list(reversed(mpp_cell_to_current_map[pv_cell])),
+                    list(reversed(mpp_cell_to_voltage_map[pv_cell])),
+                    period=np.max(mpp_cell_to_current_map[pv_cell])
+                    - np.min(mpp_cell_to_current_map[pv_cell]),
+                )
+                for pv_cell in modelling_scenario.pv_module.pv_cells_and_cell_strings
+            }
+
+            sampling_current_series = np.array(
+                [
+                    entry
+                    for entry in sorted(current_series[::CURRENT_SAMPLING_RATE])
+                    if entry <= 10
+                ]
+            )
+
+            cellwise_voltage = {
+                pv_cell: [
+                    interpreter(current)
+                    for current in tqdm(
+                        sampling_current_series,
+                        desc="Interpolation calculation",
+                        leave=False,
+                    )
+                ]
+                for pv_cell, interpreter in tqdm(
+                    cell_voltage_interpreters.items(),
+                    desc="Cell-wise calculation",
+                    leave=False,
+                )
+            }
+
+            module_voltage = [
+                sum(sublist) for sublist in zip(*cellwise_voltage.values())
+            ]
+
+            module_power = module_voltage * sampling_current_series
+
+            # Sanitise the data.
+            cut_off_index, _ = _find_zero_crossing(module_power)
+            module_power = module_power[:cut_off_index]
+            module_voltage = module_voltage[:cut_off_index]
+            sampling_current_series = sampling_current_series[:cut_off_index]
+
+            mpp_index: int = list(module_power).index(np.max(module_power))
+
+            import pdb
+
+            pdb.set_trace()
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            for index, pv_cell in enumerate(
+                modelling_scenario.pv_module.pv_cells_and_cell_strings
+            ):
+                plt.plot(
+                    mpp_cell_to_voltage_map[pv_cell],
+                    mpp_cell_to_current_map[pv_cell],
+                    label=pv_cell.cell_id,
+                    color=f"C{index}",
+                )
+
+            plt.axhline(
+                sampling_current_series[mpp_index],
+                dashes=(2, 2),
+                color="orange",
+            )
+
+            plt.ylim(bottom=0, top=10)
+            plt.legend(title="Initial index of cell in string", ncol=4)
+            plt.xlabel("Cell-wise, or cell-string-wise, voltage / V")
+            plt.ylabel("Module current / A")
+
+            plt.xlim(-1.25, 1.5)
+
+            norm = plt.Normalize(
+                0.5, len(modelling_scenario.pv_module.pv_cells_and_cell_strings) + 0.5
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom",
+                    sns.color_palette().as_hex(),
+                    len(set(modelling_scenario.pv_module.pv_cells_and_cell_strings))
+                    + 1,
+                ),
+                norm=norm,
+            )
+
+            colorbar = (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Index of PV cell or bypassed string of PV cells",
+                pad=(_pad := 0.025),
+            )
+
+            plt.legend().remove()
+
+            plt.savefig(
+                f"iv_curves_with_module_{time_string}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            left_axis = plt.gca()
+            right_axis = left_axis.twinx()
+
+            for index, pv_cell in enumerate(
+                modelling_scenario.pv_module.pv_cells_and_cell_strings
+            ):
+                left_axis.plot(
+                    mpp_cell_to_current_map[pv_cell],
+                    mpp_cell_to_power_map[pv_cell],
+                    label=pv_cell.cell_id,
+                    color=f"C{index}",
+                )
+
+            right_axis.plot(
+                sampling_current_series,
+                module_power,
+                "--",
+                color="orange",
+                label="Module power",
+            )
+            right_axis.scatter(
+                sampling_current_series[mpp_index],
+                module_power[mpp_index],
+                marker="H",
+                color="orange",
+                s=200,
+                label="Maximum power point (MPP)",
+            )
+
+            left_axis.set_ylim(bottom=-(cellwise_limit := 1.1 * np.max()), top=5)
+            right_axis.set_ylim(
+                bottom=-(power_limit := 1.1 * np.max(module_power)), top=power_limit
+            )
+            left_axis.set_xlim(0, sampling_current_series[cut_off_index])
+            right_axis.set_xlim(0, sampling_current_series[cut_off_index])
+
+            left_axis.axhline(0, dashes=(2, 2), color="grey")
+            right_axis.axhline(0, dashes=(2, 2), color="grey")
+
+            l_handles, l_labels = left_axis.get_legend_handles_labels()
+            r_handles, r_labels = right_axis.get_legend_handles_labels()
+
+            left_axis.legend(
+                l_handles + [None] + r_handles,
+                l_labels + ["Power"] + r_labels,
+                #  title="Initial index of cell in string",
+                ncol=4,
+            )
+            left_axis.set_xlabel("Module current / A")
+            left_axis.set_ylabel("Cell-wise, or cell-string-wise, power / W")
+            right_axis.set_ylabel("Module power / W")
+
+            norm = plt.Normalize(
+                0.5, len(modelling_scenario.pv_module.pv_cells_and_cell_strings) + 0.5
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom",
+                    sns.color_palette().as_hex(),
+                    len(set(modelling_scenario.pv_module.pv_cells_and_cell_strings))
+                    + 1,
+                ),
+                norm=norm,
+            )
+
+            colorbar = (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Index of PV cell or bypassed string of PV cells",
+                pad=(_pad := 0.125),
+            )
+
+            plt.legend().remove()
+
+            left_axis.legend().remove()
+            right_axis.legend().remove()
+
+            plt.savefig(
+                f"ip_curves_{time_string}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            import pdb
+
+            pdb.set_trace()
+
+        case OperatingMode.VALIDATION.value:
+            ############################################
+            # Validate the model against inputted data #
+            ############################################
+
+            # Calcualte the MPP of the PV system for each of the horus to be modelled.
+            if parsed_args.timestamps_file is None:
+                raise ArgumentError(
+                    "Cannot carry out hourly calculation without timestamps file."
+                )
+
+            # Open the timestamps file.
+            try:
+                with open(parsed_args.timestamps_file, "r") as f:
+                    timestamps_data = pd.read_csv(f, index_col="timestamp")
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    f"Could not find timestamps file: {parsed_args.timestamps_file}"
+                )
+
+            # Compute the start time within the year based on the time stamp if not provided.
+            if (_start_time_column_name := "start_time") not in timestamps_data.columns:
+                timestamps_data[_start_time_column_name] = [
+                    (
+                        datetime.datetime.combine(
+                            datetime.date(
+                                year=int(entry[0].split(" ")[0].split("/")[2]),
+                                month=int(entry[0].split(" ")[0].split("/")[1]),
+                                day=int(entry[0].split(" ")[0].split("/")[0]),
+                            ),
+                            datetime.time(
+                                hour=int(entry[0].split(" ")[1].split(":")[0])
+                            ),
+                        )
+                        - datetime.datetime(year=2023, month=1, day=1, hour=0, minute=0)
+                    ).total_seconds()
+                    / 3600
+                    for entry in timestamps_data.iterrows()
+                ]
+
+            # For each hour within the series of start times, compute the MPP
+            # unless the file for validation already exists with these times in.
+            if os.path.isfile(
+                validation_filename := "validation_file_{timestamps_filename}_{start_time}_{end_time}.json".format(
+                    timestamps_filename=parsed_args.timestamps_file,
+                    start_time=int(timestamps_data[_start_time_column_name][0]),
+                    end_time=int(timestamps_data[_start_time_column_name][-1]),
+                )
+            ):
+                with open(
+                    validation_filename, "r", encoding="UTF-8"
+                ) as validation_file:
+                    all_mpp_data = json.load(validation_file)
+
+            else:
+                results = Parallel(n_jobs=8)(
+                    delayed(
+                        functools.partial(
+                            process_single_mpp_calculation_without_pbar,
+                            irradiance_frame=irradiance_frame,
+                            locations_to_weather_and_solar_map=locations_to_weather_and_solar_map,
+                            pv_system=pv_system,
+                            scenario=modelling_scenario,
+                        )
+                    )(int(time_of_day))
+                    for time_of_day in timestamps_data[_start_time_column_name]
+                )
+
+                # Format the data correctly.
+                all_mpp_data: list[
+                    tuple[
+                        str,
+                        int,
+                        dict[BypassedCellString | PVCell, bool],
+                        dict[BypassedCellString | PVCell, float],
+                    ]
+                ] = []
+
+                daily_data = defaultdict(list)
+                for result in results:
+                    if result is not None:
+                        hour, mpp_power, bypassed_cell_strings, cellwise_mpp = result
+                        if mpp_power is not None:
+                            daily_data[
+                                (
+                                    date_str := (
+                                        initial_time + timedelta(hours=hour)
+                                    ).strftime("%d/%m/%Y")
+                                )
+                            ].append((hour, mpp_power))
+                            all_mpp_data.append(
+                                (
+                                    date_str,
+                                    hour,
+                                    mpp_power,
+                                    bypassed_cell_strings,
+                                    cellwise_mpp,
+                                )
+                            )
+
+                all_mpp_data = [
+                    [
+                        entry[0],
+                        entry[1],
+                        entry[2],
+                        {key.cell_id: bool(value) for key, value in entry[3].items()},
+                        {key.cell_id: value for key, value in entry[4].items()},
+                    ]
+                    for entry in all_mpp_data
+                ]
+
+                with open(
+                    validation_filename, "w", encoding="UTF-8"
+                ) as validation_file:
+                    json.dump(all_mpp_data, validation_file, indent=4)
+
+            all_mpp_frame = pd.DataFrame(
+                {
+                    "date": [entry[0] for entry in all_mpp_data],
+                    "hour": [entry[1] for entry in all_mpp_data],
+                    "Predicted PV to batt": [entry[2] for entry in all_mpp_data],
+                }
+            )
+            all_mpp_frame["date"] = (
+                ["01/12/2023"] * 9
+                + ["02/12/2023"] * 9
+                + ["03/12/2023"] * 15
+                + ["04/12/2023"] * 7
+                + ["05/12/2023"] * 8
+                + ["06/12/2023"] * 8
+                + ["07/12/2023"] * 8
+                + ["08/12/2023"] * 9
+                + ["09/12/2023"] * 15
+                + ["10/12/2023"] * 8
+                + ["11/12/2023"] * 9
+                + ["12/12/2023"] * 8
+                + ["13/12/2023"] * 8
+                + ["14/12/2023"] * 8
+                + ["15/12/2023"] * 9
+                + ["16/12/2023"] * 12
+                + ["17/12/2023"] * 7
+                + ["18/12/2023"] * 8
+                + ["19/12/2023"] * 7
+                + ["20/12/2023"] * 9
+                + ["21/12/2023"] * 8
+                + ["22/12/2023"] * 16
+                + ["23/12/2023"] * 16
+                + ["24/12/2023"] * 8
+                + ["25/12/2023"] * 7
+                + ["26/12/2023"] * 9
+                + ["27/12/2023"] * 7
+                + ["28/12/2023"] * 8
+                + ["29/12/2023"] * 9
+                + ["30/12/2023"] * 8
+                + ["31/12/2023"] * 9
+            )
+            timestamps_data = pd.merge(
+                timestamps_data, all_mpp_frame, how="left", on=["date", "hour"]
+            )
+
+            # timestamps_data["Predicted PV to batt"] = [
+            #     entry[2] for entry in all_mpp_data
+            # ]
+
+            timestamps_data["Combined hourly PV to batt"] *= 100
+            timestamps_data["Max PV to batt"] *= 100
+            timestamps_data["Min PV to batt"] *= 100
+
+            timestamps_data["full_date"] = timestamps_data["date"]
+            try:
+                timestamps_data["date"] = [
+                    int(entry.split("/")[0]) for entry in timestamps_data["date"]
+                ]
+            except AttributeError:
+                try:
+                    timestamps_data["date"] = [
+                        int(entry.split("/")[0]) for entry in timestamps_data.index
+                    ]
+                except AttributeError:
+                    raise Exception("Failed to parse timestamps data.")
+
+            # Plot the validation data
+            sns.set_palette(
+                sns.color_palette(
+                    [
+                        "#8F1838",
+                        "#C11F33",
+                        "#EA1D2D",
+                        "#F36E24",
+                        "#F99D25",
+                        "#FDB714",
+                        "#00ACD7",
+                        "#007DBB",
+                        "#00558A",
+                        "#1A3668",
+                        "#48773C",
+                        "#40AE49",
+                    ]
                 )
             )
 
-        end_time = time.time()
-        print(f"Parallel processing took {end_time - start_time:.2f} seconds")
+            date_adjustment_factor: float = 1 / len(set(timestamps_data["date"]))
 
-        # Process results and accumulate daily data
-        all_mpp_data = []
+            import pdb
 
-        for result in results:
-            if result is not None:
-                hour, mpp_power, date_str = result
-                if mpp_power is not None:
-                    daily_data[date_str].append((hour, mpp_power))
-                    all_mpp_data.append((date_str, hour, mpp_power))
+            pdb.set_trace()
 
-        # Save daily data to a single Excel file with separate sheets
-        with pd.ExcelWriter(
-            mpp_filename,
-            engine="openpyxl",
-        ) as writer:
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            sns.set_palette(sns.cubehelix_palette(start=0.2, rot=-0.4, n_colors=31))
+            for index in timestamps_data.index:
+                plt.plot(
+                    [
+                        x_coord := timestamps_data["hour"][index]
+                        + date_adjustment_factor
+                        * (date_number := int(timestamps_data["date"][index]))
+                        - date_adjustment_factor,
+                        x_coord,
+                    ],
+                    [
+                        timestamps_data["Predicted PV to batt"][index],
+                        timestamps_data["Combined hourly PV to batt"][index],
+                    ],
+                    color=f"C{date_number}",
+                    label=timestamps_data["date"][index],
+                )
+                plt.scatter(
+                    [x_coord],
+                    [timestamps_data["Predicted PV to batt"][index]],
+                    edgecolors=[f"C{date_number}"],
+                    marker="h",
+                    s=75,
+                    facecolors="none",
+                )
+                plt.scatter(
+                    [x_coord],
+                    [timestamps_data["Combined hourly PV to batt"][index]],
+                    facecolors=[f"C{date_number}"],
+                    marker="h",
+                    s=50,
+                    edgecolors="none",
+                )
 
-            # Ensure at least one sheet is present and visible
-            workbook = writer.book
-            placeholder_sheet = workbook.create_sheet(title="Sheet1")
+            norm = plt.Normalize(
+                0.5,
+                31.5,
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom", sns.color_palette().as_hex(), 31
+                ),
+                norm=norm,
+            )
+            (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Day of the month",
+                pad=(_pad := 0.025),
+            )
 
-            for date_str, data in daily_data.items():
-                df = pd.DataFrame(data, columns=["Hour", "MPP (W)"])
-                total_mpp = df["MPP (W)"].sum()
-                df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
-                df.to_excel(writer, sheet_name=date_str, index=False)
+            plt.legend().remove()
 
-            # Remove the placeholder sheet if it was not used
-            if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
-                del workbook["Sheet1"]
-    else:
-        print(f"Skipping MPP calculation for {scenario.name} as output file already exists.")
+            plt.xlim(7, 17)
+            sns.despine()
+            plt.xlabel("Hour of the day")
+            plt.ylabel("Power produced / kW")
+            plt.savefig(
+                "validation_figure_{INDEX}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
 
-        
-    
-    # #TODO:
-    # # - Improve the speed of the calculation so it can be run for all hours.
-    # # - Some way to store whether the cells have been bypassed.
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            sns.set_palette(sns.cubehelix_palette(start=0.2, rot=-0.4, n_colors=31))
+            timestamps_data["Delta prediction vs model"] = (
+                timestamps_data["Predicted PV to batt"]
+                - timestamps_data["Combined hourly PV to batt"]
+            )
+            for index in timestamps_data.index:
+                plt.plot(
+                    [
+                        x_coord := timestamps_data["hour"][index]
+                        + date_adjustment_factor
+                        * (date_number := int(timestamps_data["date"][index]))
+                        - date_adjustment_factor,
+                        x_coord,
+                    ],
+                    [
+                        0,
+                        timestamps_data["Delta prediction vs model"][index],
+                    ],
+                    color=f"C{date_number}",
+                    label=timestamps_data["date"][index],
+                )
+                plt.scatter(
+                    [x_coord],
+                    [timestamps_data["Delta prediction vs model"][index]],
+                    edgecolors=[f"C{date_number}"],
+                    marker="h",
+                    s=75,
+                    facecolors="none",
+                )
+                # plt.scatter(
+                #     [x_coord],
+                #     [timestamps_data["Combined hourly PV to batt"][index]],
+                #     facecolors=[f"C{date_number}"],
+                #     marker="h",
+                #     s=50,
+                #     edgecolors="none",
+                # )
 
-    ######################################################
-    # Plot the irradiance on each cell across the module #
-    ######################################################
+            norm = plt.Normalize(
+                0.5,
+                31.5,
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom", sns.color_palette().as_hex(), 31
+                ),
+                norm=norm,
+            )
+            (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Day of the month",
+                pad=(_pad := 0.025),
+            )
 
-#     plt.figure(figsize=(48 / 5, 32 / 5))
-#     plt.scatter(
-#         [pv_cell.cell_id for pv_cell in scenario.pv_module.pv_cells],
-#         [
-#             1000
-#             * irradiance_frame.set_index("hour")
-#             .iloc[(plotting_time_of_day := 4812)]
-#             .values[pv_cell.cell_id+1]
-#             for pv_cell in scenario.pv_module.pv_cells
-#         ],
-#         color="orange",
-#         marker="D",
-#         s=150,
-#         alpha=0.55,
-#     )
-#     plt.xlabel("Cell ID")
-#     plt.ylabel("Irradiance / W/m$^2$")
-#     plt.savefig(
-#         f"{output_directory}/irradiance_graph_{scenario.name}_{plotting_time_of_day}.{(fig_format:='pdf')}",
-#         # transparent=True,
-#         format=fig_format,
-#         # dpi=300,
-#         bbox_inches="tight",
-#     )
+            plt.legend().remove()
 
-#     plt.figure(figsize=(48 / 5, 32 / 5))
-#     plt.scatter(
-#         [pv_cell.cell_id for pv_cell in scenario.pv_module.pv_cells],
-#         [
-#             pv_cell.average_cell_temperature(
-#                 locations_to_weather_and_solar_map[scenario.location][
-#                     plotting_time_of_day
-#                 ][TEMPERATURE]
-#                 + 273.15,
-#                 1000
-#                 * irradiance_frame.set_index("hour")
-#                 .iloc[plotting_time_of_day]
-#                 .iloc[pv_cell.cell_id+1],
-#                 0,
-#             )
-#             - 273.15
-#             for pv_cell in scenario.pv_module.pv_cells
-#         ],
-#         color="red",
-#         marker="D",
-#         s=150,
-#         alpha=0.55,
-#         edgecolor=None,
-#     )
-#     plt.xlabel("Cell ID")
-#     plt.ylabel("Temperature / Degrees Celsius")
-#     plt.savefig(
-#         f"{output_directory}/temperature_graph_{scenario.name}_{plotting_time_of_day}.{fig_format}",
-#         transparent=True,
-#         format="png",
-#         dpi=300,
-#         bbox_inches="tight",
-#     )
+            plt.xlim(7, 17)
+            sns.despine()
+            plt.xlabel("Hour of the day")
+            plt.ylabel("P-PV model over/under prediction / kW")
+            plt.savefig(
+                "validation_figure_delta_{INDEX}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
 
-#     plt.show()
+            # Open and parse the diffuse data on the diffusive fraction
+            try:
+                with open("december_diffuse_fraction.csv", "r") as diffuse_data_file:
+                    diffuse_data = pd.read_csv(diffuse_data_file)
+            except FileNotFoundError:
+                raise FileNotFoundError(
+                    "Could not find difffuse-fraction information."
+                ) from None
 
-#     import pdb
+            diffuse_data.columns = pd.Index(["time"] + list(diffuse_data.columns)[1:])
+            diffuse_data["full_date"] = [
+                entry.split(" ")[0] for entry in diffuse_data["time"]
+            ]
+            diffuse_data["date"] = [
+                int(entry.split("/")[0]) for entry in diffuse_data["full_date"]
+            ]
+            diffuse_data["hour"] = [
+                int(entry.split(" ")[1].split(":")[0]) for entry in diffuse_data["time"]
+            ]
 
-#     pdb.set_trace()
+            def _parse_diffusive_fraction(entry: str) -> float | None:
+                try:
+                    return float(entry)
+                except ValueError:
+                    return None
 
-#     def _post_process_split_axes(ax1, ax2):
-#         """
-#         Function to post-process the joining of axes.
-#         Adapted from:
-#             https://matplotlib.org/stable/gallery/subplots_axes_and_figures/broken_axis.html
-#         """
-#         # hide the spines between ax and ax2
-#         ax1.spines.bottom.set_visible(False)
-#         ax1.spines.top.set_visible(False)
-#         ax2.spines.top.set_visible(False)
-#         ax1.tick_params(
-#             labeltop=False, labelbottom=False
-#         )  # don't put tick labels at the top
-#         ax2.xaxis.tick_bottom()
-#         # Now, let's turn towards the cut-out slanted lines.
-#         # We create line objects in axes coordinates, in which (0,0), (0,1),
-#         # (1,0), and (1,1) are the four corners of the axes.
-#         # The slanted lines themselves are markers at those locations, such that the
-#         # lines keep their angle and position, independent of the axes size or scale
-#         # Finally, we need to disable clipping.
-#         d = 0.5  # proportion of vertical to horizontal extent of the slanted line
-#         kwargs = dict(
-#             marker=[(-1, -d), (1, d)],
-#             markersize=12,
-#             linestyle="none",
-#             color="k",
-#             mec="k",
-#             mew=1,
-#             clip_on=False,
-#         )
-#         ax1.plot([0], [0], transform=ax1.transAxes, **kwargs)
-#         ax2.plot([0], [1], transform=ax2.transAxes, **kwargs)
+            diffuse_data["Diffusive fraction"] = [
+                _parse_diffusive_fraction(entry)
+                for entry in diffuse_data["Diffusive fraction"]
+            ]
 
-#     gridspec = {"hspace": 0.1, "height_ratios": [1, 1, 0.4, 1, 1]}
-#     fig, axes = plt.subplots(5, 2, figsize=(48 / 5, 32 / 5), gridspec_kw=gridspec)
-#     fig.subplots_adjust(hspace=0, wspace=0.25)
+            mean_diffuse = {
+                date: diffuse_data[diffuse_data["date"] == date][
+                    "Diffusive fraction"
+                ].mean()
+                for date in set(diffuse_data["date"])
+            }
+            std_diffuse = {
+                date: diffuse_data[diffuse_data["date"] == date][
+                    "Diffusive fraction"
+                ].std()
+                for date in set(diffuse_data["date"])
+            }
+            diffuse_frame = pd.DataFrame(
+                {"date": mean_diffuse.keys(), "mean": mean_diffuse.values()}
+            )
+            std_frame = pd.DataFrame(
+                {"date": std_diffuse.keys(), "std": std_diffuse.values()}
+            )
+            diffuse_frame = diffuse_frame.merge(std_frame)
 
-#     axes[2, 0].set_visible(False)
-#     axes[2, 1].set_visible(False)
-#     y_label_coord: int = int(-850)
+            # Categorise the days based on whether they're consistently cloudy, sunny,
+            # etc.
+            def _category(mean: float, std: float) -> str:
+                """
+                Categorise days based on whether they're consistently cloudy or sunny.
 
-#     axes[1, 0].sharex(axes[0, 0])
-#     axes[4, 0].sharex(axes[3, 0])
-#     axes[4, 1].sharex(axes[3, 1])
-#     axes[1, 1].sharex(axes[0, 1])
-    
-#     # plug the parameters into the SDE and solve for IV curves:
-#     SDE_params = {
-#         'photocurrent': IL,
-#         'saturation_current': I0,
-#         'resistance_series': Rs,
-#         'resistance_shunt': Rsh,
-#         'nNsVth': nNsVth
-#     }
-#     curve_info = pvlib.pvsystem.singlediode(method='lambertw', **SDE_params)
-#     v = pd.DataFrame(np.linspace(0., curve_info['v_oc'], 100))
-#     i = pd.DataFrame(pvlib.pvsystem.i_from_v(voltage=v, method='lambertw', **SDE_params))
-#     plt.plot(v, i)
-#     plt.show()
-#     # curve_info = pvlib.pvsystem.singlediode(
-#     #     photocurrent=IL,
-#     #     saturation_current=I0,
-#     #     resistance_series=Rs,
-#     #     resistance_shunt=Rsh,
-#     #     nNsVth=nNsVth,
-#     #     #ivcurve_pnts=100,
-#     #     method="lambertw",
-#     # )
-#     # plt.plot(curve_info["v_oc"], curve_info["i"])
-#     # plt.show()
+                :param: mean:
+                    The mean value
 
-#     # pvlib.singlediode.bishop88_i_from_v(
-#     #     -14.95,
-#     #     photocurrent=IL,
-#     #     saturation_current=I0,
-#     #     resistance_series=Rs,
-#     #     resistance_shunt=Rsh,
-#     #     nNsVth=nNsVth,
-#     #     breakdown_voltage=-15,
-#     #     breakdown_factor=2e-3,
-#     #     breakdown_exp=3,
-#     # )
+                :param: std:
+                    The std value
 
-#     # v_oc = pvlib.singlediode.bishop88_v_from_i(
-#     #     0.0,
-#     #     photocurrent=IL,
-#     #     saturation_current=I0,
-#     #     resistance_series=Rs,
-#     #     resistance_shunt=Rsh,
-#     #     nNsVth=nNsVth,
-#     #     method="lambertw",
-#     # )
-#     # voltage_array = np.linspace(-15 * 0.999, v_oc, 1000)
-#     # ivcurve_i, ivcurve_v, _ = pvlib.singlediode.bishop88(
-#     #     voltage_array,
-#     #     photocurrent=IL,
-#     #     saturation_current=I0,
-#     #     resistance_series=Rs,
-#     #     resistance_shunt=Rsh,
-#     #     nNsVth=nNsVth,
-#     #     breakdown_voltage=-15,
-#     # )
-    
-#     # plt.plot(ivcurve_v, ivcurve_i, label="IV Curve")
-#     # plt.xlabel("Voltage (V)")
-#     # plt.ylabel("Current (A)")
-#     # plt.title("IV Curve")
-#     # plt.legend()
-#     # plt.grid()
-#     # plt.show()
+                :returns: A `str` which categorises the day.
+
+                """
+                # Days which are consistent
+                if std <= 0.1:
+                    if mean <= 0.2:
+                        return "Consistently sunny"
+                    if mean >= 0.8:
+                        return "Consistently cloudy"
+                if mean <= 0.5:
+                    return "Intermittently sunny"
+                return "Intermittently cloudy"
+
+            diffuse_frame["category"] = [
+                _category(row["mean"], row["std"])
+                for _, row in diffuse_frame.iterrows()
+            ]
+
+            sns.set_palette(
+                list(reversed(["#423252", "#4A688B", "#779FB1", "#36C7B8", "#FBC412"]))
+            )
+
+            timestamps_data = timestamps_data.merge(diffuse_frame, on="date")
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            sns.violinplot(
+                timestamps_data,
+                x="date",
+                y="Delta prediction vs model",
+                hue="category",
+                hue_order=[
+                    "Consistently sunny",
+                    "Intermittently sunny",
+                    "Intermittently cloudy",
+                    "Consistently cloudy",
+                ],
+                inner=None,
+                edgecolor=None,
+                alpha=0.55,
+                cut=0,
+            )
+            sns.swarmplot(
+                timestamps_data,
+                x="date",
+                y="Delta prediction vs model",
+                marker="D",
+                hue="category",
+                hue_order=[
+                    "Consistently sunny",
+                    "Intermittently sunny",
+                    "Intermittently cloudy",
+                    "Consistently cloudy",
+                ],
+            )
+
+            plt.axhline(0, color="grey")
+
+            sns.despine()
+            plt.xlabel("Hour of the day")
+            plt.ylabel("P-PV model over/under prediction / kW")
+            handles, labels = plt.gca().get_legend_handles_labels()
+
+            plt.legend(handles[:4], labels[:4], title="Day category")
+
+            plt.savefig(
+                f"validation_figure_by_diffusivity_{INDEX}.png",
+                transparent=True,
+                bbox_inches="tight",
+                pad_inches=0.04,
+            )
+            plt.savefig(
+                f"validation_figure_by_diffusivity_{INDEX}.pdf",
+                bbox_inches="tight",
+                pad_inches=0.04,
+            )
+
+            plt.show()
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            sns.scatterplot(
+                diffuse_frame,
+                x="date",
+                y="mean",
+                hue="category",
+                marker="h",
+                s=140,
+                hue_order=[
+                    "Consistently sunny",
+                    "Intermittently sunny",
+                    "Intermittently cloudy",
+                    "Consistently cloudy",
+                ],
+            )
+            plt.errorbar(
+                (
+                    diffuse_slice := diffuse_frame[
+                        diffuse_frame["category"] == "Consistently sunny"
+                    ]
+                )["date"],
+                diffuse_slice["mean"],
+                yerr=diffuse_slice["std"],
+                ls="none",
+                color="C0",
+            )
+            plt.errorbar(
+                (
+                    diffuse_slice := diffuse_frame[
+                        diffuse_frame["category"] == "Intermittently sunny"
+                    ]
+                )["date"],
+                diffuse_slice["mean"],
+                yerr=diffuse_slice["std"],
+                ls="none",
+                color="C1",
+            )
+            plt.errorbar(
+                (
+                    diffuse_slice := diffuse_frame[
+                        diffuse_frame["category"] == "Intermittently cloudy"
+                    ]
+                )["date"],
+                diffuse_slice["mean"],
+                yerr=diffuse_slice["std"],
+                ls="none",
+                color="C2",
+            )
+            plt.errorbar(
+                (
+                    diffuse_slice := diffuse_frame[
+                        diffuse_frame["category"] == "Consistently cloudy"
+                    ]
+                )["date"],
+                diffuse_slice["mean"],
+                yerr=diffuse_slice["std"],
+                ls="none",
+                color="C3",
+            )
+
+            plt.legend(title="Day category")
+            plt.xlabel("Day of the month")
+            plt.ylabel("Diffusive fraction ($D$)")
+
+            # sns.despine()
+            plt.savefig(
+                "december_diffusive_fraction.pdf", bbox_inches="tight", pad_inches=0
+            )
+
+            plt.show()
+
+            timestamps_data["Predicted PV error"] = (
+                0.181 * timestamps_data["Predicted PV to batt"]
+            )
+
+            # Plot the irradiance for set days as maps in the same way.
+            stagger: float = 0.05
+            _, axes = plt.subplots(1, 2, figsize=(48 / 5, 32 / 5))
+            sns.set_palette(["#42597F", "#FBC412"])
+            index: int = 0
+
+            for date_index in set(timestamps_data["date"]):
+                if date_index not in (11, 15):
+                    continue
+                plt.figure(figsize=(48 / 5, 32 / 5))
+                ax1 = plt.gca()
+                plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+                ax1.plot(
+                    plotting_data["hour"],
+                    plotting_data["Predicted PV to batt"],
+                    label="Modelled output power",
+                    color="C0",
+                )
+                ax1.errorbar(
+                    [entry - stagger for entry in plotting_data["hour"]],
+                    plotting_data["Predicted PV to batt"],
+                    capsize=5,
+                    color="C0",
+                    ls="none",
+                    yerr=plotting_data["Predicted PV error"],
+                )
+                ax1.fill_between(
+                    plotting_data["hour"],
+                    [0] * len(plotting_data),
+                    plotting_data["Predicted PV to batt"],
+                    color="C0",
+                    alpha=0.15,
+                )
+                ax1.plot(
+                    plotting_data["hour"],
+                    plotting_data["Combined hourly PV to batt"],
+                    label="Measured output power",
+                    color="C0",
+                )
+                ax1.errorbar(
+                    [entry + stagger for entry in plotting_data["hour"]],
+                    plotting_data["Combined hourly PV to batt"],
+                    capsize=5,
+                    color="C1",
+                    ls="none",
+                    yerr=(
+                        plotting_data["Combined hourly PV to batt"]
+                        - plotting_data["Min PV to batt"],
+                        plotting_data["Max PV to batt"]
+                        - plotting_data["Combined hourly PV to batt"],
+                    ),
+                )
+                ax1.fill_between(
+                    plotting_data["hour"],
+                    [0] * len(plotting_data),
+                    plotting_data["Combined hourly PV to batt"],
+                    color="C1",
+                    alpha=0.15,
+                )
+                ax2 = ax1.twinx()
+                ax2.plot(
+                    (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                        "hour"
+                    ],
+                    diffuse_slice["Diffusive fraction"],
+                    "--",
+                    color="black",
+                    label="Diffuse fraction estimate",
+                )
+                plt.xlabel("Hour of the day")
+                ax1.set_ylabel("Power produced / kW")
+                ax2.set_ylabel("Diffuse fraction")
+                ax1.set_ylim(0, 100)
+                ax1.set_xlim(6, 18)
+                ax2.set_ylim(0, 1)
+                ax1.legend(loc="upper left")
+                ax2.legend(loc="upper right")
+                sns.despine(right=False)
+
+            plt.show()
+
+            # Plot the consistently sunny days
+            fig, axes = plt.subplots(1, 2, figsize=(48 / 5, 24 / 5))
+            sns.set_palette(["#42597F", "#FBC412"])
+
+            date_index = 11
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax1 := axes[0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax1.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax1.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax1.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax2 = ax1.twinx()
+            ax2.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax1.set_xlabel("Hour of the day")
+            ax1.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax1.set_ylim(0, 100)
+            ax1.set_xlim(6, 18)
+            ax2.set_ylim(0, 1)
+            ax1.legend(loc="upper left")
+            # ax2.legend(loc="upper right")
+            ax1.tick_params(right=False)
+            ax2.tick_params(left=False, right=False)
+            ax2.set_yticklabels([])
+            sns.despine(ax=ax1, right=True, left=False)
+            sns.despine(ax=ax2, right=True, left=False)
+
+            date_index = 15
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax3 := axes[1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax3.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax3.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax3.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax4 = ax3.twinx()
+            ax4.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax3.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax4.set_ylabel("Diffuse fraction ($D$)")
+            ax3.set_ylim(0, 100)
+            ax3.set_xlim(6, 18)
+            ax4.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax4.legend(loc="upper right")
+            ax3.tick_params(left=False)
+            ax3.set_yticklabels([])
+            ax4.tick_params(left=False)
+            sns.despine(ax=ax3, right=False, left=True)
+            sns.despine(ax=ax4, right=False, left=True)
+
+            fig.subplots_adjust(wspace=0.15)
+
+            ax1.set_title(r"11$^{\rm{th}}$ December", weight="bold")
+            ax3.set_title(r"15$^{\rm{th}}$ December", weight="bold")
+            ax2.text(4.05, 1.05, "a.", fontweight="bold", fontsize=16)
+            ax4.text(5.05, 1.05, "b.", fontweight="bold", fontsize=16)
+
+            plt.savefig(
+                "december_sunny_days_output_validation.pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+
+            plt.show()
+
+            # Plot the intermittently cloudy days
+            fig, axes = plt.subplots(2, 2, figsize=(48 / 5, 48 / 5))
+            sns.set_palette(["#42597F", "#36C7B8"])
+
+            date_index = 2
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax1 := axes[0][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax1.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax1.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax1.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax2 = ax1.twinx()
+            ax2.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax1.set_xlabel("Hour of the day")
+            ax1.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax1.set_ylim(0, 100)
+            ax1.set_xlim(6, 18)
+            ax2.set_ylim(0, 1)
+            ax1.legend(loc="upper left")
+            # ax2.legend(loc="upper right")
+            ax1.tick_params(right=False)
+            ax2.tick_params(left=False, right=False)
+            ax2.set_yticklabels([])
+            sns.despine(ax=ax1, right=True, left=False)
+            sns.despine(ax=ax2, right=True, left=False)
+
+            date_index = 6
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax3 := axes[0][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax3.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax3.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax3.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax4 = ax3.twinx()
+            ax4.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax3.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax4.set_ylabel("Diffuse fraction ($D$)")
+            ax3.set_ylim(0, 100)
+            ax3.set_xlim(6, 18)
+            ax4.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax4.legend(loc="upper right")
+            ax3.tick_params(left=False)
+            ax3.set_yticklabels([])
+            ax4.tick_params(left=False)
+            sns.despine(ax=ax3, right=False, left=True)
+            sns.despine(ax=ax4, right=False, left=True)
+
+            date_index = 8
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax5 := axes[1][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax5.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax5.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax5.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax6 = ax5.twinx()
+            ax6.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax5.set_xlabel("Hour of the day")
+            ax5.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax5.set_ylim(0, 100)
+            ax5.set_xlim(6, 18)
+            ax6.set_ylim(0, 1)
+            ax5.legend(loc="upper left")
+            # ax3.legend(loc="upper left")
+            ax5.tick_params(right=False)
+            ax6.tick_params(left=False, right=False)
+            ax6.set_yticklabels([])
+            sns.despine(ax=ax5, right=True, left=False)
+            sns.despine(ax=ax6, right=True, left=False)
+
+            date_index = 17
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax7 := axes[1][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax7.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax7.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax7.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax8 = ax7.twinx()
+            ax8.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax7.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax8.set_ylabel("Diffuse fraction ($D$)")
+            ax7.set_ylim(0, 100)
+            ax7.set_xlim(6, 18)
+            ax8.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax8.legend(loc="upper right")
+            ax7.tick_params(left=False)
+            ax7.set_yticklabels([])
+            ax8.tick_params(left=False)
+            sns.despine(ax=ax7, right=False, left=True)
+            sns.despine(ax=ax8, right=False, left=True)
+
+            fig.subplots_adjust(wspace=0.15, hspace=0.35)
+
+            ax1.set_title(r"2$^{\rm{nd}}$ December", weight="bold")
+            ax3.set_title(r"6$^{\rm{th}}$ December", weight="bold")
+            ax5.set_title(r"8$^{\rm{th}}$ December", weight="bold")
+            ax7.set_title(r"17$^{\rm{th}}$ December", weight="bold")
+            ax2.text(4.05, 1.05, "a.", fontweight="bold", fontsize=16)
+            ax4.text(5.05, 1.05, "b.", fontweight="bold", fontsize=16)
+            ax6.text(4.05, 1.05, "c.", fontweight="bold", fontsize=16)
+            ax8.text(5.05, 1.05, "d.", fontweight="bold", fontsize=16)
+
+            plt.savefig(
+                "december_partly_sunny_days_output_validation.pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+
+            plt.show()
+
+            # Plot the consistently cloudy days
+            fig, axes = plt.subplots(2, 2, figsize=(48 / 5, 48 / 5))
+            sns.set_palette(["#42597F", "#379CCA"])
+
+            date_index = 4
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax1 := axes[0][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax1.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax1.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax1.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax2 = ax1.twinx()
+            ax2.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax1.set_xlabel("Hour of the day")
+            ax1.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax1.set_ylim(0, 100)
+            ax1.set_xlim(6, 18)
+            ax2.set_ylim(0, 1)
+            ax1.legend(loc="upper left")
+            # ax2.legend(loc="upper right")
+            ax1.tick_params(right=False)
+            ax2.tick_params(left=False, right=False)
+            ax2.set_yticklabels([])
+            sns.despine(ax=ax1, right=True, left=False)
+            sns.despine(ax=ax2, right=True, left=False)
+
+            date_index = 5
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax3 := axes[0][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax3.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax3.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax3.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax4 = ax3.twinx()
+            ax4.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax3.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax4.set_ylabel("Diffuse fraction ($D$)")
+            ax3.set_ylim(0, 100)
+            ax3.set_xlim(6, 18)
+            ax4.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax4.legend(loc="upper right")
+            ax3.tick_params(left=False)
+            ax3.set_yticklabels([])
+            ax4.tick_params(left=False)
+            sns.despine(ax=ax3, right=False, left=True)
+            sns.despine(ax=ax4, right=False, left=True)
+
+            date_index = 25
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax5 := axes[1][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax5.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax5.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax5.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax6 = ax5.twinx()
+            ax6.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax5.set_xlabel("Hour of the day")
+            ax5.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax5.set_ylim(0, 100)
+            ax5.set_xlim(6, 18)
+            ax6.set_ylim(0, 1)
+            ax5.legend(loc="upper left")
+            # ax3.legend(loc="upper left")
+            ax5.tick_params(right=False)
+            ax6.tick_params(left=False, right=False)
+            ax6.set_yticklabels([])
+            sns.despine(ax=ax5, right=True, left=False)
+            sns.despine(ax=ax6, right=True, left=False)
+
+            date_index = 27
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax7 := axes[1][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax7.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax7.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax7.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax8 = ax7.twinx()
+            ax8.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax7.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax8.set_ylabel("Diffuse fraction ($D$)")
+            ax7.set_ylim(0, 100)
+            ax7.set_xlim(6, 18)
+            ax8.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax8.legend(loc="upper right")
+            ax7.tick_params(left=False)
+            ax7.set_yticklabels([])
+            ax8.tick_params(left=False)
+            sns.despine(ax=ax7, right=False, left=True)
+            sns.despine(ax=ax8, right=False, left=True)
+
+            fig.subplots_adjust(wspace=0.15, hspace=0.35)
+
+            ax1.set_title(r"4$^{\rm{th}}$ December", weight="bold")
+            ax3.set_title(r"5$^{\rm{th}}$ December", weight="bold")
+            ax5.set_title(r"25$^{\rm{th}}$ December", weight="bold")
+            ax7.set_title(r"27$^{\rm{th}}$ December", weight="bold")
+
+            ax2.text(4.05, 1.05, "a.", fontweight="bold", fontsize=16)
+            ax4.text(5.05, 1.05, "b.", fontweight="bold", fontsize=16)
+            ax6.text(4.05, 1.05, "c.", fontweight="bold", fontsize=16)
+            ax8.text(5.05, 1.05, "d.", fontweight="bold", fontsize=16)
+
+            plt.savefig(
+                "december_cloudy_days_output_validation.pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+
+            plt.show()
+
+            # Plot the consistently cloudy AND days
+            fig, axes = plt.subplots(3, 2, figsize=(48 / 5, 72 / 5))
+            sns.set_palette(["#42597F", "#379CCA", "#FBC412"])
+
+            date_index = 11
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax1 := axes[0][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax1.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax1.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C2",
+            )
+            ax1.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C2",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax1.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C2",
+                alpha=0.15,
+            )
+            ax2 = ax1.twinx()
+            ax2.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax1.set_xlabel("Hour of the day")
+            ax1.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax1.set_ylim(0, 100)
+            ax1.set_xlim(6, 18)
+            ax2.set_ylim(0, 1)
+            ax1.legend(loc="upper left")
+            # ax2.legend(loc="upper right")
+            ax1.tick_params(right=False)
+            ax2.tick_params(left=False, right=False)
+            ax2.set_yticklabels([])
+            sns.despine(ax=ax1, right=True, left=False)
+            sns.despine(ax=ax2, right=True, left=False)
+
+            date_index = 15
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax3 := axes[0][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax3.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax3.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C2",
+            )
+            ax3.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C2",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax3.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C2",
+                alpha=0.15,
+            )
+            ax4 = ax3.twinx()
+            ax4.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax3.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax4.set_ylabel("Diffuse fraction ($D$)")
+            ax3.set_ylim(0, 100)
+            ax3.set_xlim(6, 18)
+            ax4.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax4.legend(loc="upper right")
+            ax3.tick_params(left=False)
+            ax3.set_yticklabels([])
+            ax4.tick_params(left=False)
+            sns.despine(ax=ax3, right=False, left=True)
+            sns.despine(ax=ax4, right=False, left=True)
+
+            ax1.set_title(r"11$^{\rm{th}}$ December", weight="bold")
+            ax3.set_title(r"15$^{\rm{th}}$ December", weight="bold")
+            ax2.text(4.05, 1.05, "a.", fontweight="bold", fontsize=16)
+            ax4.text(5.05, 1.05, "b.", fontweight="bold", fontsize=16)
+
+            date_index = 4
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax5 := axes[1][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax5.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax5.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax5.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax5.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax6 = ax5.twinx()
+            ax6.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax5.set_xlabel("Hour of the day")
+            ax5.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax5.set_ylim(0, 100)
+            ax5.set_xlim(6, 18)
+            ax6.set_ylim(0, 1)
+            ax5.legend(loc="upper left")
+            # ax2.legend(loc="upper right")
+            ax5.tick_params(right=False)
+            ax6.tick_params(left=False, right=False)
+            ax6.set_yticklabels([])
+            sns.despine(ax=ax5, right=True, left=False)
+            sns.despine(ax=ax6, right=True, left=False)
+
+            date_index = 5
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax7 := axes[1][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax7.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax7.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax7.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax7.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax8 = ax7.twinx()
+            ax8.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax7.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax8.set_ylabel("Diffuse fraction ($D$)")
+            ax7.set_ylim(0, 100)
+            ax7.set_xlim(6, 18)
+            ax8.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax8.legend(loc="upper right")
+            ax7.tick_params(left=False)
+            ax7.set_yticklabels([])
+            ax8.tick_params(left=False)
+            sns.despine(ax=ax7, right=False, left=True)
+            sns.despine(ax=ax8, right=False, left=True)
+
+            date_index = 25
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax9 := axes[2][0]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax9.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax9.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax9.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax9.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax9.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax10 = ax9.twinx()
+            ax10.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax9.set_xlabel("Hour of the day")
+            ax9.set_ylabel("Power produced / kW")
+            # ax2.set_ylabel("Diffuse fraction")
+            ax9.set_ylim(0, 100)
+            ax9.set_xlim(6, 18)
+            ax10.set_ylim(0, 1)
+            ax9.legend(loc="upper left")
+            # ax3.legend(loc="upper left")
+            ax9.tick_params(right=False)
+            ax10.tick_params(left=False, right=False)
+            ax10.set_yticklabels([])
+            sns.despine(ax=ax9, right=True, left=False)
+            sns.despine(ax=ax10, right=True, left=False)
+
+            date_index = 27
+            plotting_data = timestamps_data[timestamps_data["date"] == date_index]
+            (ax11 := axes[2][1]).plot(
+                plotting_data["hour"],
+                plotting_data["Predicted PV to batt"],
+                label="Modelled output power",
+                color="C0",
+            )
+            ax11.errorbar(
+                [entry - stagger for entry in plotting_data["hour"]],
+                plotting_data["Predicted PV to batt"],
+                capsize=5,
+                color="C0",
+                ls="none",
+                yerr=plotting_data["Predicted PV error"],
+            )
+            ax11.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Predicted PV to batt"],
+                color="C0",
+                alpha=0.15,
+            )
+            ax11.plot(
+                plotting_data["hour"],
+                plotting_data["Combined hourly PV to batt"],
+                label="Measured output power",
+                color="C1",
+            )
+            ax11.errorbar(
+                [entry + stagger for entry in plotting_data["hour"]],
+                plotting_data["Combined hourly PV to batt"],
+                capsize=5,
+                color="C1",
+                ls="none",
+                yerr=(
+                    plotting_data["Combined hourly PV to batt"]
+                    - plotting_data["Min PV to batt"],
+                    plotting_data["Max PV to batt"]
+                    - plotting_data["Combined hourly PV to batt"],
+                ),
+            )
+            ax11.fill_between(
+                plotting_data["hour"],
+                [0] * len(plotting_data),
+                plotting_data["Combined hourly PV to batt"],
+                color="C1",
+                alpha=0.15,
+            )
+            ax12 = ax11.twinx()
+            ax12.plot(
+                (diffuse_slice := diffuse_data[diffuse_data["date"] == date_index])[
+                    "hour"
+                ],
+                diffuse_slice["Diffusive fraction"],
+                "--",
+                color="black",
+                label="Diffuse fraction estimate",
+            )
+            ax11.set_xlabel("Hour of the day")
+            # ax3.set_ylabel("Power produced / kW")
+            ax12.set_ylabel("Diffuse fraction ($D$)")
+            ax11.set_ylim(0, 100)
+            ax11.set_xlim(6, 18)
+            ax12.set_ylim(0, 1)
+            # ax3.legend(loc="upper left")
+            ax12.legend(loc="upper right")
+            ax11.tick_params(left=False)
+            ax11.set_yticklabels([])
+            ax12.tick_params(left=False)
+            sns.despine(ax=ax11, right=False, left=True)
+            sns.despine(ax=ax12, right=False, left=True)
+
+            fig.subplots_adjust(wspace=0.15, hspace=0.35)
+
+            ax5.set_title(r"4$^{\rm{th}}$ December", weight="bold")
+            ax7.set_title(r"5$^{\rm{th}}$ December", weight="bold")
+            ax9.set_title(r"25$^{\rm{th}}$ December", weight="bold")
+            ax11.set_title(r"27$^{\rm{th}}$ December", weight="bold")
+
+            ax6.text(4.05, 1.05, "c.", fontweight="bold", fontsize=16)
+            ax8.text(5.05, 1.05, "d.", fontweight="bold", fontsize=16)
+            ax10.text(4.05, 1.05, "e.", fontweight="bold", fontsize=16)
+            ax12.text(5.05, 1.05, "f.", fontweight="bold", fontsize=16)
+
+            plt.savefig("ere_december_days.pdf", bbox_inches="tight", pad_inches=0)
+
+            plt.show()
+
+            import pdb
+
+            pdb.set_trace()
+
+            plt.errorbar(
+                sliced_data[sliced_data["hour"] == hour]["Combined hourly PV to batt"],
+                sliced_data[sliced_data["hour"] == hour]["Predicted PV to batt"],
+                xerr=(
+                    sliced_data[sliced_data["hour"] == hour][
+                        "Combined hourly PV to batt"
+                    ]
+                    - sliced_data[sliced_data["hour"] == hour]["Min PV to batt"],
+                    sliced_data[sliced_data["hour"] == hour]["Max PV to batt"]
+                    - sliced_data[sliced_data["hour"] == hour][
+                        "Combined hourly PV to batt"
+                    ],
+                ),
+                yerr=sliced_data[sliced_data["hour"] == hour]["Predicted PV error"],
+                ecolor=f"C{index}",
+                # fmt="gh",
+                fmt="none",
+            )
+
+            plt.scatter(
+                [x_coord],
+                [timestamps_data["Predicted PV to batt"][index]],
+                edgecolors=[f"C{date_number}"],
+                marker="h",
+                s=75,
+                facecolors="none",
+            )
+            plt.scatter(
+                [x_coord],
+                [timestamps_data["Combined hourly PV to batt"][index]],
+                facecolors=[f"C{date_number}"],
+                marker="h",
+                s=50,
+                edgecolors="none",
+            )
+
+            norm = plt.Normalize(
+                0.5,
+                31.5,
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom", sns.color_palette().as_hex(), 31
+                ),
+                norm=norm,
+            )
+            (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Day of the month",
+                pad=(_pad := 0.025),
+            )
+
+            plt.legend().remove()
+
+            plt.xlim(7, 17)
+            sns.despine()
+            plt.xlabel("Hour of the day")
+            plt.ylabel("Power produced / kW")
+            plt.savefig(
+                "validation_figure_{INDEX}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+            plt.show()
+
+            import pdb
+
+            pdb.set_trace()
+
+            # def _trial_function(x: float, a: float, b: float, c: float) -> float:
+            def _trial_function(x: float, a: float, b: float) -> float:
+                """
+                A guess at the distribution, perhaps x^2.
+
+                """
+                return a * x + b
+                # return a * x ** 2 + b * x + c
+
+            fit = scipy.optimize.curve_fit(
+                _trial_function,
+                timestamps_data["Combined hourly PV to batt"],
+                timestamps_data["Predicted PV to batt"],
+            )
+            fit_no_zeros = scipy.optimize.curve_fit(
+                _trial_function,
+                timestamps_data[timestamps_data["Predicted PV to batt"] > 0.1][
+                    "Combined hourly PV to batt"
+                ],
+                timestamps_data[timestamps_data["Predicted PV to batt"] > 0.1][
+                    "Predicted PV to batt"
+                ],
+            )
+
+            # Determine the wind-speed data
+            wind_speed_data = [
+                entry["wind_speed"]
+                for entry in locations_to_weather_and_solar_map[
+                    modelling_scenario.location
+                ]
+            ]
+            wind_speed_slice = [
+                wind_speed_data[hour]
+                for hour in timestamps_data["start_time"].astype(int)
+            ]
+            timestamps_data["wind_speed"] = wind_speed_slice
+
+            # Compute the likely temperature difference in the panels
+
+            # Compute a likely predicted error bar
+            timestamps_data["Predicted PV error"] = (
+                0.181 * timestamps_data["Predicted PV to batt"]
+            )
+            timestamps_data["Measured PV error"] = (
+                0.181 * timestamps_data["Combined hourly PV to batt"]
+            )
+
+            cmap = sns.cubehelix_palette(start=-0.4, rot=-0.4, as_cmap=True)
+            sns.set_palette(sns.cubehelix_palette(start=-0.4, rot=-0.4, n_colors=31))
+
+            plt.figure(figsize=(48 / 5, 32 / 5))
+            sns.scatterplot(
+                timestamps_data,
+                x="Combined hourly PV to batt",
+                y="Predicted PV to batt",
+                hue="date",
+                marker="h",
+                s=75,
+                alpha=0.8,
+                palette=cmap,
+                # facecolors="none",
+            )
+
+            for index, date in enumerate(set(timestamps_data["date"])):
+                sliced_data = timestamps_data[timestamps_data["date"] == date]
+                plt.errorbar(
+                    sliced_data["Combined hourly PV to batt"],
+                    sliced_data["Predicted PV to batt"],
+                    xerr=(
+                        sliced_data["Combined hourly PV to batt"]
+                        - sliced_data["Min PV to batt"],
+                        sliced_data["Max PV to batt"]
+                        - sliced_data["Combined hourly PV to batt"],
+                    ),
+                    yerr=sliced_data["Predicted PV error"],
+                    ecolor=f"C{index}",
+                    fmt="none",
+                )
+
+            plt.plot(
+                linspace := np.linspace(
+                    0,
+                    max(
+                        timestamps_data["Combined hourly PV to batt"].max(),
+                        timestamps_data["Predicted PV to batt"].max(),
+                    ),
+                    1000,
+                ),
+                linspace,
+                "--",
+                color="black",
+                label="Ideal fit",
+            )
+
+            sns.regplot(
+                timestamps_data,
+                x="Combined hourly PV to batt",
+                y="Predicted PV to batt",
+                # hue="date",
+                marker="h",
+                color="C30",
+                scatter=False,
+                # s=75,
+                # alpha=0.8,
+                # palette=cmap
+            )
+
+            # plt.plot(
+            #     linspace,
+            #     [_trial_function(entry, *fit[0]) for entry in linspace],
+            #     "--",
+            #     color="orange",
+            #     label="Curve fit",
+            # )
+
+            # plt.plot(
+            #     linspace,
+            #     [_trial_function(entry, *fit_no_zeros[0]) for entry in linspace],
+            #     "--",
+            #     color="teal",
+            #     label="Curve fit (ignoring zeroes)",
+            # )
+
+            plt.xlabel("Measured output power / kW")
+            plt.ylabel("Modelled output power / kW")
+            xlim = plt.xlim(-5, 100)
+            ylim = plt.ylim(-5, 80)
+
+            sns.despine()
+
+            norm = plt.Normalize(
+                0.5,
+                31.5,
+            )
+            scalar_mappable = plt.cm.ScalarMappable(
+                cmap=mcolors.LinearSegmentedColormap.from_list(
+                    "Custom", sns.color_palette().as_hex(), 31
+                ),
+                norm=norm,
+            )
+            (axis := plt.gca()).figure.colorbar(
+                scalar_mappable,
+                ax=axis,
+                label="Day of the month",
+                pad=(_pad := 0.025),
+            )
+
+            plt.legend().remove()
+
+            plt.savefig(
+                f"variation_scatter_{INDEX}.pdf",
+                format="pdf",
+                bbox_inches="tight",
+                pad_inches=0,
+            )
+
+            plt.show()
+
+            sns.set_palette(sns.cubehelix_palette(start=0.2, rot=-0.4, n_colors=13))
+            cmap = sns.cubehelix_palette(start=0.2, rot=-0.4, n_colors=13, as_cmap=True)
+
+            for date in range(31):
+                plt.figure(figsize=(48 / 5, 32 / 5))
+                sns.scatterplot(
+                    (
+                        sliced_data := timestamps_data[
+                            (timestamps_data["date"] == date)
+                            & (timestamps_data["hour"] >= 6)
+                            & (timestamps_data["hour"] <= 18)
+                        ]
+                    ),
+                    x="Combined hourly PV to batt",
+                    y="Predicted PV to batt",
+                    hue="hour",
+                    hue_norm=(6, 18),
+                    hue_order=sorted(range(6, 18)),
+                    marker="h",
+                    s=75,
+                    alpha=1.0,
+                    # color=f"C{date}"
+                    palette=cmap,
+                    # facecolors="none",
+                )
+                for index, hour in enumerate(range(6, 19)):
+                    if len(sliced_data[sliced_data["hour"] == hour]) == 0:
+                        continue
+                    plt.errorbar(
+                        sliced_data[sliced_data["hour"] == hour][
+                            "Combined hourly PV to batt"
+                        ],
+                        sliced_data[sliced_data["hour"] == hour][
+                            "Predicted PV to batt"
+                        ],
+                        xerr=(
+                            sliced_data[sliced_data["hour"] == hour][
+                                "Combined hourly PV to batt"
+                            ]
+                            - sliced_data[sliced_data["hour"] == hour][
+                                "Min PV to batt"
+                            ],
+                            sliced_data[sliced_data["hour"] == hour]["Max PV to batt"]
+                            - sliced_data[sliced_data["hour"] == hour][
+                                "Combined hourly PV to batt"
+                            ],
+                        ),
+                        yerr=sliced_data[sliced_data["hour"] == hour][
+                            "Predicted PV error"
+                        ],
+                        ecolor=f"C{index}",
+                        # fmt="gh",
+                        fmt="none",
+                    )
+                plt.plot(
+                    sliced_data["Combined hourly PV to batt"],
+                    sliced_data["Predicted PV to batt"],
+                    "-.",
+                    color="grey",
+                )
+                plt.plot(
+                    linspace := np.linspace(
+                        0,
+                        max(
+                            timestamps_data["Combined hourly PV to batt"].max(),
+                            timestamps_data["Predicted PV to batt"].max(),
+                        ),
+                        1000,
+                    ),
+                    linspace,
+                    "--",
+                    color="black",
+                    label="Ideal fit",
+                )
+                # plt.plot(
+                #     linspace,
+                #     [_trial_function(entry, *fit[0]) for entry in linspace],
+                #     "--",
+                #     color="orange",
+                #     label="Curve fit",
+                # )
+                # plt.plot(
+                #     linspace,
+                #     [_trial_function(entry, *fit_no_zeros[0]) for entry in linspace],
+                #     "--",
+                #     color="teal",
+                #     label="Curve fit (ignoring zeroes)",
+                # )
+                plt.xlabel("Measured output power / kW")
+                plt.ylabel("Modelled output power / kW")
+                plt.xlim(*xlim)
+                plt.ylim(*ylim)
+                plt.legend().remove()
+                norm = plt.Normalize(5.5, 18.5)
+                scalar_mappable = plt.cm.ScalarMappable(
+                    cmap=mcolors.LinearSegmentedColormap.from_list(
+                        "Custom", sns.color_palette().as_hex(), 13
+                    ),
+                    norm=norm,
+                )
+                (axis := plt.gca()).figure.colorbar(
+                    scalar_mappable,
+                    ax=axis,
+                    label="Hour of the day",
+                    pad=(_pad := 0.025),
+                )
+                plt.savefig(
+                    f"validation_for_day_{date}_{INDEX}.pdf",
+                    format="pdf",
+                    bbox_inches="tight",
+                    pad_inches=0,
+                )
+
+            plt.show()
+
+            import pdb
+
+            pdb.set_trace()
+
+        case _:
+            raise ArgumentError(
+                "The operating mode specified is not implemented. Exiting."
+            )
+
+    # # Save daily data to a single Excel file with separate sheets
+    # with pd.ExcelWriter(
+    #     os.path.join(
+    #         OUTPUT_DIRECTORY, f"mpp_daily_summary_{modelling_scenario.name}.xlsx"
+    #     ),
+    #     engine="openpyxl",
+    # ) as writer:
+
+    #     # Ensure at least one sheet is present and visible
+    #     workbook = writer.book
+    #     placeholder_sheet = workbook.create_sheet(title="Sheet1")
+
+    #     for date_str, data in daily_data.items():
+    #         df = pd.DataFrame(data, columns=[HOUR, "Power / W"])
+    #         total_mpp = df["Power / W"].sum()
+    #         df.loc["Total"] = ["Total", total_mpp]  # Adding the total MPP at the end
+    #         df.to_excel(writer, sheet_name=date_str, index=False)
+
+    #     # Remove the placeholder sheet if it was not used
+    #     if "Sheet1" in workbook.sheetnames and len(workbook.sheetnames) > 1:
+    #         del workbook["Sheet1"]
+
+    # # #TODO:
+    # # # - Improve the speed of the calculation so it can be run for all hours.
+    # # # - Some way to store whether the cells have been bypassed.
+
+    # def _post_process_split_axes(ax1, ax2):
+    #     """
+    #     Function to post-process the joining of axes.
+    #     Adapted from:
+    #         https://matplotlib.org/stable/gallery/subplots_axes_and_figures/broken_axis.html
+    #     """
+    #     # hide the spines between ax and ax2
+    #     ax1.spines.bottom.set_visible(False)
+    #     ax1.spines.top.set_visible(False)
+    #     ax2.spines.top.set_visible(False)
+    #     ax1.tick_params(
+    #         labeltop=False, labelbottom=False
+    #     )  # don't put tick labels at the top
+    #     ax2.xaxis.tick_bottom()
+    #     # Now, let's turn towards the cut-out slanted lines.
+    #     # We create line objects in axes coordinates, in which (0,0), (0,1),
+    #     # (1,0), and (1,1) are the four corners of the axes.
+    #     # The slanted lines themselves are markers at those locations, such that the
+    #     # lines keep their angle and position, independent of the axes size or scale
+    #     # Finally, we need to disable clipping.
+    #     d = 0.5  # proportion of vertical to horizontal extent of the slanted line
+    #     kwargs = dict(
+    #         marker=[(-1, -d), (1, d)],
+    #         markersize=12,
+    #         linestyle="none",
+    #         color="k",
+    #         mec="k",
+    #         mew=1,
+    #         clip_on=False,
+    #     )
+    #     ax1.plot([0], [0], transform=ax1.transAxes, **kwargs)
+    #     ax2.plot([0], [1], transform=ax2.transAxes, **kwargs)
+
+    # gridspec = {"hspace": 0.1, "height_ratios": [1, 1, 0.4, 1, 1]}
+    # fig, axes = plt.subplots(5, 2, figsize=(48 / 5, 32 / 5), gridspec_kw=gridspec)
+    # fig.subplots_adjust(hspace=0, wspace=0.25)
+
+    # axes[2, 0].set_visible(False)
+    # axes[2, 1].set_visible(False)
+    # y_label_coord: int = int(-850)
+
+    # axes[0, 0].get_shared_x_axes().join(axes[0, 0], axes[1, 0])
+    # axes[3, 0].get_shared_x_axes().join(axes[3, 0], axes[4, 0])
+    # axes[3, 1].get_shared_x_axes().join(axes[3, 1], axes[4, 1])
+    # axes[0, 1].get_shared_x_axes().join(axes[0, 1], axes[1, 1])
+
+    # curve_info = pvlib.pvsystem.singlediode(
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     ivcurve_pnts=100,
+    #     method="lambertw",
+    # )
+    # plt.plot(curve_info["v"], curve_info["i"])
+    # plt.show()
+
+    # pvlib.singlediode.bishop88_i_from_v(
+    #     -14.95,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     breakdown_voltage=-15,
+    #     breakdown_factor=2e-3,
+    #     breakdown_exp=3,
+    # )
+
+    # v_oc = pvlib.singlediode.bishop88_v_from_i(
+    #     0.0,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     method="lambertw",
+    # )
+    # voltage_array = np.linspace(-15 * 0.999, v_oc, 1000)
+    # ivcurve_i, ivcurve_v, _ = pvlib.singlediode.bishop88(
+    #     voltage_array,
+    #     photocurrent=IL,
+    #     saturation_current=I0,
+    #     resistance_series=Rs,
+    #     resistance_shunt=Rsh,
+    #     nNsVth=nNsVth,
+    #     breakdown_voltage=-15,
+    # )
 
     # # Determine the scenario index
-    # try:
-    #     scenario_index: int = [
-    #         index
-    #         for index, scenario in enumerate(scenarios)
-    #         if scenario.name == parsed_args.scenario
-    #     ][0]
-    # except IndexError:
-    #     raise IndexError(
-    #         "Unable to find current scenario weather information."
-    #     ) from None
 
     # frame_slice = (
     #     cellwise_irradiance_frames[scenario_index][1]
-    #     .iloc[(start_index:=parsed_args.start_day_index) : start_index + 24]
+    #     .iloc[(start_index := parsed_args.start_day_index) : start_index + 24]
     #     .set_index("hour")
     # )
-    # frame_slice.pop(date_and_time)
     # sns.heatmap(
     #     frame_slice,
     #     cmap=sns.blend_palette(
@@ -1699,150 +5189,7 @@ def main(unparsed_arguments) -> None:
     # )
     # plt.xlabel("Cell index within panel")
     # plt.ylabel("Hour of the day")
-    # plt.title(f"Cell irradiance on {start_index // 24 + 1} day of the year")
     # plt.show()
-    
-    # pdb.set_trace()
-
-    # frame_to_plot = cellwise_irradiance_frames[scenario_index][1]
-    # date_and_time_series = frame_to_plot.pop(date_and_time)
-    # initial_time = datetime.strptime(str(date_and_time_series.iloc[0]), "%Y-%m-%d %H:%M")
-   
-    # plot_irradiance_with_marginal_means(
-    #     frame_to_plot,
-    #     start_index=(start_index := 24 * 31 * 6 + 48),
-    #     figname=f"{scenario.name}_{parsed_args.start_day_index}_small_panel",
-    #     heatmap_vmax=(
-    #         heatmap_vmax := frame_to_plot
-    #         .set_index("hour")
-    #         .iloc[start_index : start_index + 24]
-    #         .max()
-    #         .max()
-    #     ),
-    #     initial_date=initial_time,
-    #     irradiance_bar_vmax=(
-    #         irradiance_bar_vmax := (
-    #             max(
-    #                 frame_to_plot
-    #                 .set_index("hour")
-    #                 .iloc[start_index : start_index + 24]
-    #                 .mean(axis=1)
-    #                 .max(),
-    #                 0,
-    #                 # cellwise_irradiance_frames[1][1]
-    #                 # .set_index("hour")
-    #                 # .iloc[start_index : start_index + 24]
-    #                 # .mean(axis=1)
-    #                 # .max(),
-    #                 # cellwise_irradiance_frames[2][1]
-    #                 # .set_index("hour")
-    #                 # .iloc[start_index : start_index + 24]
-    #                 # .mean(axis=1)
-    #                 # .max(),
-    #             )
-    #         )
-    #     ),
-    #     irradiance_scatter_vmin=0,
-    #     irradiance_scatter_vmax=(
-    #         irradiance_scatter_vmax := 1.25
-    #         * (
-    #             max(
-    #                 frame_to_plot
-    #                 .set_index("hour")
-    #                 .iloc[start_index : start_index + 24]
-    #                 .mean(axis=0)
-    #                 .max(),
-    #                 0,
-    #                 # cellwise_irradiance_frames[1][1]
-    #                 # .set_index("hour")
-    #                 # .iloc[start_index : start_index + 24]
-    #                 # .sum(axis=0)
-    #                 # .max(),
-    #                 # cellwise_irradiance_frames[2][1]
-    #                 # .set_index("hour")
-    #                 # .iloc[start_index : start_index + 24]
-    #                 # .sum(axis=0)
-    #                 # .max(),
-    #             )
-    #         )
-    #     ),
-    # )
-
-    # # Calcualte the MPP of the PV system for each of the horus to be modelled.
-    # if parsed_args.timestamps_file is None:
-    #     raise ArgumentError(
-    #         "Cannot carry out hourly calculation without timestamps file."
-    #     )
-
-    # # Open the timestamps file.
-    # try:
-    #     with open(parsed_args.timestamps_file, "r") as f:
-    #         timestamps_data = pd.read_csv(f, index_col="timestamp")
-    # except FileNotFoundError:
-    #     raise FileNotFoundError(
-    #         f"Could not find timestamps file: {parsed_args.timestamps_file}"
-    #     )
-
-    # # Compute the start time within the year based on the time stamp if not provided.
-    # if (_start_time_column_name := "start_time") not in timestamps_data.columns:
-    #     timestamps_data[_start_time_column_name] = [
-    #         (
-    #             datetime.datetime.combine(
-    #                 datetime.date(
-    #                     year=int(entry[0].split(" ")[0].split("/")[2]),
-    #                     month=int(entry[0].split(" ")[0].split("/")[1]),
-    #                     day=int(entry[0].split(" ")[0].split("/")[0]),
-    #                 ),
-    #                 datetime.time(hour=int(entry[0].split(" ")[1].split(":")[0])),
-    #             )
-    #             - datetime.datetime(year=2023, month=1, day=1, hour=0, minute=0)
-    #         ).total_seconds()
-    #         / 3600
-    #         for entry in timestamps_data.iterrows()
-    #     ]
-
-    # # For each hour within the series of start times, compute the MPP.
-    # mpp_current_map: dict[int, float] = {}
-    # mpp_power_map: dict[int, float] = {}
-    # for start_index in tqdm(
-    #     timestamps_data[_start_time_column_name],
-    #     desc="Computing hourly MPP",
-    #     leave=True,
-    #     unit="hour",
-    # ):
-    #     individual_power_extreme: float = 0
-    #     for pv_cell in tqdm(
-    #         scenario.pv_module.pv_cells_and_cell_strings,
-    #         desc="Cellwise calculation",
-    #         leave=False,
-    #         unit="cell",
-    #     ):
-    #         # Skip if there's no irradiance.
-    #         if any(irradiance_frame.set_index("hour").iloc[int(start_index)].isna()):
-    #             continue
-    #         # Determine the cell curves.
-    #         current_series, power_series, voltage_series = pv_cell.calculate_iv_curve(
-    #             locations_to_weather_and_solar_map[scenario.location][int(start_index)][
-    #                 TEMPERATURE
-    #             ],
-    #             1000 * irradiance_frame.set_index("hour").iloc[int(start_index)],
-    #             current_series=current_series,
-    #         )
-    #         cell_to_power_map[pv_cell] = power_series
-    #         cell_to_voltage_map[pv_cell] = voltage_series
-    #     # Combine the series across each individual module
-    #     combined_power_series = sum(cell_to_power_map.values())
-    #     combined_voltage_series = sum(cell_to_voltage_map.values())
-
-    #     # Combine the series across the modules within the system.
-    #     combined_power_series = pv_system.combine_powers(combined_power_series)
-    #     combined_voltage_series = pv_system.combine_voltages(combined_voltage_series)
-    #     combined_current_series = pv_system.combine_currents(current_series)
-
-    #     # Determine the maximum power point
-    #     maximum_power_index = pd.Series(combined_power_series).idxmax()
-    #     mpp_current_map[start_index] = combined_current_series[maximum_power_index]
-    #     mpp_power_map[start_index] = combined_power_series[maximum_power_index]
 
 #     # import pdb
 
