@@ -723,7 +723,7 @@ class PVCell:
             If the cell has broken down, this is returned.
 
         """
-
+        
         cell_temperature = (
             self.average_cell_temperature(
                 ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
@@ -741,6 +741,14 @@ class PVCell:
             current_series=current_series,
             voltage_series=voltage_series,
         )
+        
+        return (
+            current_series,
+            voltage_series,
+            power_series,
+            list(voltage_series >= self.breakdown_voltage),
+        )
+        
         
     def calculate_iv_curve_interpolation(
         self,
@@ -780,7 +788,7 @@ class PVCell:
                 The voltage series.
 
         """
-
+        #print(irradiance_array.iloc[self.cell_id])
         cell_temperature = (
             self.average_cell_temperature(
                 ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
@@ -790,6 +798,7 @@ class PVCell:
             )
             - ZERO_CELSIUS_OFFSET
         )
+        print(cell_temperature)
         
         if not isinstance(voltage_interp_array,np.ndarray) or not isinstance(param_grid,np.ndarray):
             return calculate_cell_iv_curve(
@@ -809,7 +818,12 @@ class PVCell:
         
         power_series = current_series * voltage_series
         
-        return current_series, power_series, voltage_series
+        return (
+            current_series,
+            voltage_series,
+            power_series,
+            list(voltage_series >= self.breakdown_voltage),
+        )
             
         
 def interpolate_voltage_curve(
@@ -842,7 +856,15 @@ def interpolate_voltage_curve(
         v10 = voltage_curves[irrad_idx + 1, temp_idx, :]
         v11 = voltage_curves[irrad_idx + 1, temp_idx + 1, :]
     except IndexError:
-        raise IndexError("Point out of interpolating range")
+        try:
+            voltage_curves[irrad_idx+1,0,0]
+        except IndexError:
+            raise IndexError("Irrad point out of interpolating range")
+        else:
+            try:
+                voltage_curves[0,temp_idx + 1,0]
+            except IndexError:
+                raise IndexError("Temp point out of interpolating range")
         # Add run of pvlib if point doesn't exist?
     else:
         w_irrad = (target_point[0] - param_grid[irrad_idx,0,0]) / (param_grid[irrad_idx+1,0,0] - param_grid[irrad_idx,0,0])
@@ -854,12 +876,7 @@ def interpolate_voltage_curve(
         return v0 * (1 - w_irrad) + v1 * w_irrad
 
 
-        return (
-            current_series,
-            voltage_series,
-            power_series,
-            list(voltage_series >= self.breakdown_voltage),
-        )
+        
 
 
 def calculate_cell_iv_curve(
@@ -1020,6 +1037,7 @@ def calculate_cell_iv_curve(
                 )
             ]
         )
+        print(voltage_series[:40])
     elif voltage_series is not None:
         current_series = np.asarray(
             [
@@ -1053,7 +1071,7 @@ def calculate_cell_iv_curve(
 
     power_series = current_series * voltage_series
 
-    return current_series, power_series, voltage_series
+    return current_series, voltage_series, power_series
 
 
 def get_irradiance(
