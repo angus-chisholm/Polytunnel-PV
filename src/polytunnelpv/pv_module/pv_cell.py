@@ -553,50 +553,52 @@ class PVCell:
 
         """
 
-        # Calculate variable values which remain constant throughout the iteration
-        sky_temperature: float = _sky_temperature(ambient_temperature)
+        # # Calculate variable values which remain constant throughout the iteration
+        # sky_temperature: float = _sky_temperature(ambient_temperature)
 
-        # Setup inputs for the iterative loop
-        best_guess_average_temperature: float = ambient_temperature
-        solution_found: bool = False
+        # # Setup inputs for the iterative loop
+        # best_guess_average_temperature: float = ambient_temperature
+        # solution_found: bool = False
 
-        # Loop through until a solution is found
-        while not solution_found:
-            # Compute the necessary coefficients
-            radiation_to_sky_coefficient = _radiation_to_sky_coefficient(
-                self.emissivity, best_guess_average_temperature, sky_temperature
-            )
+        # # Loop through until a solution is found
+        # while not solution_found:
+        #     # Compute the necessary coefficients
+        #     radiation_to_sky_coefficient = _radiation_to_sky_coefficient(
+        #         self.emissivity, best_guess_average_temperature, sky_temperature
+        #     )
 
-            # Calculate the average temperature of the collector
-            average_temperature: float = (
-                (self.absorptivity * solar_irradiance)
-                * (
-                    1
-                    - self.reference_efficiency
-                    * (1 + self.mpp_thermal_coefficient * self.reference_temperature)
-                )
-                + _conductive_air_heat_transfer_coefficient(wind_speed)
-                * ambient_temperature
-                + radiation_to_sky_coefficient * sky_temperature
-            ) / (
-                radiation_to_sky_coefficient
-                + _conductive_air_heat_transfer_coefficient(wind_speed)
-                - self.absorptivity
-                * self.mpp_thermal_coefficient
-                * self.reference_efficiency
-                * solar_irradiance
-            )
+        #     # Calculate the average temperature of the collector
+        #     average_temperature: float = (
+        #         (self.absorptivity * solar_irradiance)
+        #         * (
+        #             1
+        #             - self.reference_efficiency
+        #             * (1 + self.mpp_thermal_coefficient * self.reference_temperature)
+        #         )
+        #         + _conductive_air_heat_transfer_coefficient(wind_speed)
+        #         * ambient_temperature
+        #         + radiation_to_sky_coefficient * sky_temperature
+        #     ) / (
+        #         radiation_to_sky_coefficient
+        #         + _conductive_air_heat_transfer_coefficient(wind_speed)
+        #         - self.absorptivity
+        #         * self.mpp_thermal_coefficient
+        #         * self.reference_efficiency
+        #         * solar_irradiance
+        #     )
 
-            # Break if this average temperature is within the required precision.
-            if (
-                abs(best_guess_average_temperature - average_temperature)
-                < TEMPERATURE_PRECISION
-            ):
-                solution_found = True
+        #     # Break if this average temperature is within the required precision.
+        #     if (
+        #         abs(best_guess_average_temperature - average_temperature)
+        #         < TEMPERATURE_PRECISION
+        #     ):
+        #         solution_found = True
 
-            best_guess_average_temperature = average_temperature
+        #     best_guess_average_temperature = average_temperature
 
-        return average_temperature
+        # return average_temperature
+        NOCT = 48
+        return ambient_temperature + solar_irradiance/800 * (NOCT-20)
 
     @property
     def azimuth_in_radians(self) -> float:
@@ -732,6 +734,7 @@ class PVCell:
             )
             - ZERO_CELSIUS_OFFSET
         )
+        print(solar_irradiance,cell_temperature)
 
         current_series, voltage_series, power_series = calculate_cell_iv_curve(
             cell_temperature,
@@ -788,7 +791,6 @@ class PVCell:
                 The voltage series.
 
         """
-        #print(irradiance_array.iloc[self.cell_id])
         cell_temperature = (
             self.average_cell_temperature(
                 ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
@@ -798,7 +800,7 @@ class PVCell:
             )
             - ZERO_CELSIUS_OFFSET
         )
-        print(cell_temperature)
+        #print(solar_irradiance,cell_temperature)
         
         if not isinstance(voltage_interp_array,np.ndarray) or not isinstance(param_grid,np.ndarray):
             return calculate_cell_iv_curve(
@@ -1037,7 +1039,6 @@ def calculate_cell_iv_curve(
                 )
             ]
         )
-        print(voltage_series[:40])
     elif voltage_series is not None:
         current_series = np.asarray(
             [

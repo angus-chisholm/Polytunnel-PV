@@ -401,7 +401,7 @@ def _find_zero_crossing(numbers: list[float | int]) -> tuple[int, float | int] |
     for index in range(1, len(numbers)):
 
         # Return the index and value of the number which crosses.
-        if numbers[index - 1] > 0 and numbers[index] <= 0:
+        if numbers[index - 1] >= 0 and numbers[index] < 0:
             return index, numbers[index]
 
     return None, None
@@ -1075,10 +1075,12 @@ def process_single_mpp_calculation_without_pbar_interpolation(
                 leave=False,
             )
         }
+        
         module_voltage = [sum(sublist) for sublist in zip(*cellwise_voltage.values())]
 
         module_power = module_voltage * sampling_current_series
 
+        print(module_power)
         # Sanitise the data to avoid erroneous results at high values where the series
         # become truncated.
         cut_off_index, _ = _find_zero_crossing(module_power)
@@ -1086,6 +1088,7 @@ def process_single_mpp_calculation_without_pbar_interpolation(
         module_voltage = module_voltage[:cut_off_index]
         sampling_current_series = sampling_current_series[:cut_off_index]
 
+        print(module_power)
         mpp_index: int = list(module_power).index(np.max(module_power))
 
         # Determine the power through the module at MPP
@@ -1197,7 +1200,7 @@ def process_single_mpp_calculation_without_pbar(
     try:
         hour = time_of_day % 24
         max_irradiance = np.max(
-            irradiance_frame.set_index("hour").iloc[time_of_day][1:]
+            irradiance_frame.set_index("hour").iloc[time_of_day]
         )
 
         if max_irradiance == 0:
@@ -1304,6 +1307,7 @@ def process_single_mpp_calculation_without_pbar(
         module_voltage = [sum(sublist) for sublist in zip(*cellwise_voltage.values())]
 
         module_power = module_voltage * sampling_current_series
+        print(module_power)
 
         # Sanitise the data to avoid erroneous results at high values where the series
         # become truncated.
@@ -1311,6 +1315,8 @@ def process_single_mpp_calculation_without_pbar(
         module_power = module_power[:cut_off_index]
         module_voltage = module_voltage[:cut_off_index]
         sampling_current_series = sampling_current_series[:cut_off_index]
+        
+        print(module_power)
 
         mpp_index: int = list(module_power).index(np.max(module_power))
 
@@ -2203,7 +2209,7 @@ def main(unparsed_arguments) -> None:
                         daily_data[
                             (
                                 date_str := (
-                                    initial_time + timedelta(hours=hour)
+                                    initial_time + timedelta(hours=hour+parsed_args.start_day_index)
                                 ).strftime("%d/%m/%Y")
                             )
                         ].append((hour, mpp_power))
@@ -2326,7 +2332,7 @@ def main(unparsed_arguments) -> None:
             
             # Calculate interpolation array
             irradiance_spectrum = np.linspace(1,34.64,201)**2 #range from 1 to 1200
-            temperature_spectrum = np.linspace(5,200,51) 
+            temperature_spectrum = np.linspace(5,100,101) 
             voltage_interp_array, param_grid = create_voltage_interpolating_array(
                                         irradiance_points=irradiance_spectrum,
                                         temperature_points=temperature_spectrum,
@@ -2390,7 +2396,7 @@ def main(unparsed_arguments) -> None:
                         daily_data[
                             (
                                 date_str := (
-                                    initial_time + timedelta(hours=hour)
+                                    initial_time + timedelta(hours=hour+parsed_args.start_day_index)
                                 ).strftime("%d/%m/%Y")
                             )
                         ].append((hour, mpp_power))
