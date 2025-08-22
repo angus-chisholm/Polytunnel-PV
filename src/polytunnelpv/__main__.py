@@ -1007,7 +1007,7 @@ def process_single_mpp_calculation_without_pbar_interpolation(
             ),
             VOLTAGE_RESOLUTION,
         )
-
+        
         individual_power_extreme = 0
         for pv_cell in tqdm(
             scenario.pv_module.pv_cells_and_cell_strings,
@@ -1015,7 +1015,7 @@ def process_single_mpp_calculation_without_pbar_interpolation(
             leave=False,
         ):
             (
-                current_series,
+                output_current_series,
                 power_series,
                 voltage_series,
                 pv_cells_bypassed,
@@ -1027,12 +1027,13 @@ def process_single_mpp_calculation_without_pbar_interpolation(
                 * irradiance_frame.set_index("hour")
                 .iloc[time_of_day]
                 .reset_index(drop=True),
+                wind_speed=0,
                 current_series=current_series,
                 voltage_interp_array=voltage_interp_array,
                 param_grid=param_grid,
             )
             
-            cell_to_current_map[pv_cell] = current_series
+            cell_to_current_map[pv_cell] = output_current_series
             cell_to_power_map[pv_cell] = power_series
             cell_to_voltage_map[pv_cell] = voltage_series
             cell_to_bypass_map[pv_cell] = pv_cells_bypassed
@@ -1080,7 +1081,7 @@ def process_single_mpp_calculation_without_pbar_interpolation(
 
         module_power = module_voltage * sampling_current_series
 
-        print(module_power)
+        #print(module_power)
         # Sanitise the data to avoid erroneous results at high values where the series
         # become truncated.
         cut_off_index, _ = _find_zero_crossing(module_power)
@@ -1088,7 +1089,7 @@ def process_single_mpp_calculation_without_pbar_interpolation(
         module_voltage = module_voltage[:cut_off_index]
         sampling_current_series = sampling_current_series[:cut_off_index]
 
-        print(module_power)
+        #print(module_power)
         mpp_index: int = list(module_power).index(np.max(module_power))
 
         # Determine the power through the module at MPP
@@ -1243,7 +1244,7 @@ def process_single_mpp_calculation_without_pbar(
             leave=False,
         ):
             (
-                current_series,
+                current_series_output,
                 power_series,
                 voltage_series,
                 pv_cells_bypassed,
@@ -1261,7 +1262,7 @@ def process_single_mpp_calculation_without_pbar(
                 current_series=current_series,
             )      
             
-            cell_to_current_map[pv_cell] = current_series
+            cell_to_current_map[pv_cell] = current_series_output
             cell_to_power_map[pv_cell] = power_series
             cell_to_voltage_map[pv_cell] = voltage_series
             cell_to_bypass_map[pv_cell] = pv_cells_bypassed
@@ -1307,7 +1308,7 @@ def process_single_mpp_calculation_without_pbar(
         module_voltage = [sum(sublist) for sublist in zip(*cellwise_voltage.values())]
 
         module_power = module_voltage * sampling_current_series
-        print(module_power)
+        #print(module_power)
 
         # Sanitise the data to avoid erroneous results at high values where the series
         # become truncated.
@@ -1316,7 +1317,7 @@ def process_single_mpp_calculation_without_pbar(
         module_voltage = module_voltage[:cut_off_index]
         sampling_current_series = sampling_current_series[:cut_off_index]
         
-        print(module_power)
+        #print(module_power)
 
         mpp_index: int = list(module_power).index(np.max(module_power))
 
@@ -2202,16 +2203,15 @@ def main(unparsed_arguments) -> None:
             ] = []
 
             daily_data = defaultdict(list)
+            day_counter = 0
             for result in results:
                 if result is not None:
                     hour, mpp_power, bypassed_cell_strings, cellwise_mpp = result
                     if mpp_power is not None:
+                        date_str = (initial_time + timedelta(hours=hour+parsed_args.start_day_index)
+                                    +timedelta(days=day_counter)).strftime("%d/%m/%Y")
                         daily_data[
-                            (
-                                date_str := (
-                                    initial_time + timedelta(hours=hour+parsed_args.start_day_index)
-                                ).strftime("%d/%m/%Y")
-                            )
+                            date_str                       
                         ].append((hour, mpp_power))
                         all_mpp_data.append(
                             (
@@ -2222,6 +2222,8 @@ def main(unparsed_arguments) -> None:
                                 cellwise_mpp,
                             )
                         )
+                        if hour == 23:
+                                day_counter +=1
 
             all_mpp_data = [
                 [
@@ -2331,8 +2333,8 @@ def main(unparsed_arguments) -> None:
         case OperatingMode.HOURLY_MPP_INTERPOLATION.value:
             
             # Calculate interpolation array
-            irradiance_spectrum = np.linspace(1,34.64,201)**2 #range from 1 to 1200
-            temperature_spectrum = np.linspace(5,100,101) 
+            irradiance_spectrum = np.linspace(1,34.64,101)**2 #range from 1 to 1200
+            temperature_spectrum = np.linspace(5,100,51) 
             voltage_interp_array, param_grid = create_voltage_interpolating_array(
                                         irradiance_points=irradiance_spectrum,
                                         temperature_points=temperature_spectrum,
@@ -2389,16 +2391,15 @@ def main(unparsed_arguments) -> None:
             ] = []
 
             daily_data = defaultdict(list)
+            day_counter = 0
             for result in results:
                 if result is not None:
                     hour, mpp_power, bypassed_cell_strings, cellwise_mpp = result
                     if mpp_power is not None:
+                        date_str = (initial_time + timedelta(hours=hour+parsed_args.start_day_index)
+                                    +timedelta(days=day_counter)).strftime("%d/%m/%Y")
                         daily_data[
-                            (
-                                date_str := (
-                                    initial_time + timedelta(hours=hour+parsed_args.start_day_index)
-                                ).strftime("%d/%m/%Y")
-                            )
+                            date_str                       
                         ].append((hour, mpp_power))
                         all_mpp_data.append(
                             (
@@ -2409,6 +2410,8 @@ def main(unparsed_arguments) -> None:
                                 cellwise_mpp,
                             )
                         )
+                        if hour == 23:
+                                day_counter +=1 
 
             all_mpp_data = [
                 [

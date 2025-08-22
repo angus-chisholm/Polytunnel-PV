@@ -734,7 +734,7 @@ class PVCell:
             )
             - ZERO_CELSIUS_OFFSET
         )
-        print(solar_irradiance,cell_temperature)
+        #print(solar_irradiance,cell_temperature)
 
         current_series, voltage_series, power_series = calculate_cell_iv_curve(
             cell_temperature,
@@ -757,6 +757,7 @@ class PVCell:
         self,
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
+        wind_speed: float,
         voltage_interp_array: np.ndarray | None = None,
         param_grid: np.ndarray | None = None,
         *,
@@ -795,8 +796,7 @@ class PVCell:
             self.average_cell_temperature(
                 ambient_celsius_temperature + ZERO_CELSIUS_OFFSET,
                 (solar_irradiance := irradiance_array.iloc[self.cell_id]),
-                # TODO: Implement wind speed here using renewables.ninja data.
-                0,
+                wind_speed,
             )
             - ZERO_CELSIUS_OFFSET
         )
@@ -811,6 +811,8 @@ class PVCell:
             current_series=current_series,
             voltage_series=voltage_series,
         )
+        
+        #print(np.shape(current_series))
         
         voltage_series = interpolate_voltage_curve(
             voltage_interp_array,

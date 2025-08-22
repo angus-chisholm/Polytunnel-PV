@@ -224,7 +224,6 @@ class BypassedCellString:
             Whether the PV cells have been bypassed.
 
         """
-
         # Set the bypass-diode tepmerature.
         self.set_bypass_diode_temperature(ambient_celsius_temperature, irradiance_array)
 
@@ -293,12 +292,12 @@ class BypassedCellString:
         ambient_celsius_temperature: float,
         irradiance_array: np.ndarray,
         wind_speed: float,
+        voltage_interp_array: np.ndarray | None = None,
+        param_grid: np.ndarray | None = None,
         *,
         current_density_series: np.ndarray | None = None,
         current_series: np.ndarray | None = None,
         voltage_series: np.ndarray | None = None,
-        voltage_interp_arrray: np.ndarray | None,
-        param_grid: np.ndarray | None,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[bool]]:
         """
         Calculate the IV curve for the bypassed string of cells.
@@ -337,10 +336,11 @@ class BypassedCellString:
             Whether the PV cells have been bypassed.
 
         """
-
+        
         # Set the bypass-diode tepmerature.
         self.set_bypass_diode_temperature(ambient_celsius_temperature, irradiance_array)
 
+        #print(f"point 2: {np.shape(current_series)}")
         # Calculate the curves for each cell
         cell_to_iv_series: dict[PVCell, tuple[np.ndarray, np.ndarray, np.ndarray]] = {
             pv_cell: pv_cell.calculate_iv_curve_interpolation(
@@ -350,12 +350,14 @@ class BypassedCellString:
                 current_density_series=current_density_series,
                 current_series=current_series,
                 # voltage_series=voltage_series,
-                voltage_interp_array=voltage_interp_arrray,
+                voltage_interp_array = voltage_interp_array,
                 param_grid=param_grid,
+                
             )
             for pv_cell in tqdm(self.pv_cells, desc="Bypassed IV curves", leave=False)
         }
-
+        #print(f"point 3: {np.shape(current_series)}")
+        
         # Add up the voltage for each cell
         combined_voltage_series = sum(
             cell_to_iv_series[pv_cell][2] for pv_cell in self.pv_cells
@@ -381,6 +383,8 @@ class BypassedCellString:
             combined_voltage_series[combined_voltage_series > 0]
         )
 
+        #print(f"point 4: {np.shape(current_series)}")
+        
         sorted_voltage_series, sorted_total_current = zip(
             *sorted(zip(voltage_values, total_current))
         )
@@ -395,6 +399,8 @@ class BypassedCellString:
             current > cell_string_interp(voltage)
             for current, voltage in zip(bypass_diode_curve, bypass_voltage_series)
         ) + [False] * len(combined_voltage_series[combined_voltage_series > 0])
+
+        #print(f"point 5: {np.shape(current_series)}")
 
         return (
             sorted_total_current,
